@@ -19,10 +19,13 @@ import {
 } from 'node:path'
 import {
   lstat,
+  readFile,
   readdir,
+  rename,
   rmdir,
   rm,
   unlink,
+  writeFile,
 } from 'node:fs/promises'
 
 /** Cordis function-plugin name. */
@@ -49,12 +52,16 @@ const MAX_REFERENCE_SESSIONS = 400
 const FACT_CACHE_TTL_MS = 5 * 60 * 1000
 const PAGE_EVENTS = 500
 const MAX_EVENTS_PER_SESSION = 100000
+const CONVERSATION_BASE = 'conversations'
+const CONVERSATION_METADATA = 'session.json'
+const CONVERSATION_INDEX = 'index.json'
 
 const SKIP_DIRS = new Set([
   '.git',
   '.hg',
   '.svn',
   'node_modules',
+  'conversations',
   '.venv',
   'venv',
   '__pycache__',
@@ -147,6 +154,126 @@ function pathKey(path) {
 
 function formatError(error) {
   return error instanceof Error ? error.message : String(error)
+}
+
+async function readJsonFile(path, fallback) {
+  try {
+    return JSON.parse(await readFile(path, 'utf8'))
+  } catch {
+    return fallback
+  }
+}
+
+async function readConversationMetadata(folder) {
+  const value = await readJsonFile(join(folder, CONVERSATION_METADATA), undefined)
+  return value !== null && typeof value === 'object' ? value : undefined
+}
+
+function isConversationFolderFor(folder, metadata, id, workspaceRoot) {
+  if (metadata === undefined || metadata === null) return false
+  if (metadata.sessionId !== id) return false
+  if (typeof metadata.workspace !== 'string' || !samePath(metadata.workspace, workspaceRoot)) return false
+  const resolvedFolder = resolve(folder)
+  const resolvedRoot = resolve(workspaceRoot)
+  if (samePath(resolvedFolder, resolvedRoot) || !isInside(resolvedFolder, resolvedRoot)) return false
+  const base = dirname(resolvedFolder)
+  if (!samePath(dirname(base), resolvedRoot)) return false
+  const recorded = metadata.folder
+  const matchesName = safeConversationName(recorded) && samePath(join(base, recorded), resolvedFolder)
+  const matchesAbsolute = typeof recorded === 'string' && recorded.length > 0 && samePath(recorded, resolvedFolder)
+  if (!matchesName && !matchesAbsolute) return false
+  return true
+}
+
+function safeConversationName(name) {
+  return typeof name === 'string' &&
+    name.length > 0 &&
+    name !== '.' &&
+    name !== '..' &&
+    basename(name) === name &&
+    !name.includes('/') &&
+    !name.includes('\\')
+}
+
+async function conversationFromIndex(workspaceRoot, id) {
+  const base = join(workspaceRoot, CONVERSATION_BASE)
+  const indexPath = join(base, CONVERSATION_INDEX)
+  const index = await readJsonFile(indexPath, undefined)
+  if (index === null || typeof index !== 'object' || Array.isArray(index)) return undefined
+  const entry = index[id]
+  const name = entry !== null && typeof entry === 'object' ? entry.folder : undefined
+  if (!safeConversationName(name)) return undefined
+  const folder = join(base, name)
+  if (!(await isRealDirectory(folder))) return undefined
+  const metadata = await readConversationMetadata(folder)
+  if (!isConversationFolderFor(folder, metadata, id, workspaceRoot)) return undefined
+  return {
+    workspace: resolve(workspaceRoot),
+    base: resolve(base),
+    folder: resolve(folder),
+    indexPath,
+    metadata,
+  }
+}
+
+async function conversationFromFacts(workspaceRoot, id, facts) {
+  if (workspaceRoot === undefined || facts === undefined) return undefined
+  const candidates = []
+  if (typeof facts.finalCwd === 'string') candidates.push(facts.finalCwd)
+  for (const cwd of facts.cwdHistory) candidates.push(cwd)
+  const seen = new Set()
+  for (const candidate of candidates) {
+    const folder = resolve(candidate)
+    const key = pathKey(folder)
+    if (seen.has(key)) continue
+    seen.add(key)
+    if (!(await isRealDirectory(folder))) continue
+    const metadata = await readConversationMetadata(folder)
+    if (!isConversationFolderFor(folder, metadata, id, workspaceRoot)) continue
+    return {
+      workspace: resolve(workspaceRoot),
+      base: dirname(folder),
+      folder,
+      indexPath: join(dirname(folder), CONVERSATION_INDEX),
+      metadata,
+    }
+  }
+  return undefined
+}
+
+async function findConversationFolder(workspaceRoot, id, facts) {
+  if (workspaceRoot === undefined) return undefined
+  const fromFacts = await conversationFromFacts(workspaceRoot, id, facts)
+  if (fromFacts !== undefined) return fromFacts
+  return await conversationFromIndex(workspaceRoot, id)
+}
+
+async function indexConversationFolders(workspaceRoots, ids) {
+  const wanted = new Set(ids)
+  const found = new Map()
+  for (const workspaceRoot of workspaceRoots) {
+    const base = join(workspaceRoot, CONVERSATION_BASE)
+    const index = await readJsonFile(join(base, CONVERSATION_INDEX), undefined)
+    if (index === null || typeof index !== 'object' || Array.isArray(index)) continue
+    for (const id of wanted) {
+      if (found.has(id)) continue
+      const entry = index[id]
+      const name = entry !== null && typeof entry === 'object' ? entry.folder : undefined
+      if (!safeConversationName(name)) continue
+      const folder = join(base, name)
+      if (!(await isRealDirectory(folder))) continue
+      const metadata = await readConversationMetadata(folder)
+      if (!isConversationFolderFor(folder, metadata, id, workspaceRoot)) continue
+      found.set(id, {
+        workspace: resolve(workspaceRoot),
+        base: resolve(base),
+        folder: resolve(folder),
+        indexPath: join(base, CONVERSATION_INDEX),
+        metadata,
+      })
+    }
+  }
+  return found
 }
 
 /**
@@ -408,6 +535,12 @@ function extractFacts(events, headerCwd) {
   for (const event of events) {
     if (typeof event.time === 'number' && event.time > lastEventTime) lastEventTime = event.time
     attachmentRecords(event.data, attachments)
+    if (event.type === 'working-directory/change' && typeof event.data?.cwd === 'string' && event.data.cwd.length > 0) {
+      const next = resolve(event.data.cwd)
+      currentCwd = next
+      cwdHistory.add(next)
+      continue
+    }
     if (event.type !== 'tool/call') continue
     const data = event.data
     let args
@@ -605,6 +738,7 @@ async function buildPreview(ctx, ids, options) {
   const unreadable = new Set()
   let sessionBytes = 0
   let projectionBytes = 0
+  let conversationBytes = 0
 
   for (const id of unique) {
     const snapshot = snapshotById.get(id)
@@ -617,6 +751,7 @@ async function buildPreview(ctx, ids, options) {
       live: false,
       missing: snapshot === undefined,
       workspace: workspace === undefined ? null : { title: workspace.title, path: workspace.path },
+      conversationFolder: null,
       logDir: undefined,
       logFiles: [],
       logBytes: 0,
@@ -644,8 +779,9 @@ async function buildPreview(ctx, ids, options) {
       warnings.push(`Session ${id}: its stored log directory was not found. Only the archive entry and checkpoint can be removed.`)
     }
 
+    let facts
     try {
-      const facts = await factsFor(ctx, id, snapshot.revision, snapshot.header.cwd)
+      facts = await factsFor(ctx, id, snapshot.revision, snapshot.header.cwd)
       base.lastEventTime = facts.lastEventTime || base.createdAt
       if (facts.truncated === true) {
         unreadable.add(id)
@@ -669,7 +805,34 @@ async function buildPreview(ctx, ids, options) {
       base.readError = formatError(error)
       warnings.push(`Session ${id}: its event log could not be read (${base.readError}). Attachment and file cleanup is disabled for this run.`)
     }
+
+    const conversationRoot = workspace?.path ?? snapshot.header.cwd
+    const conversation = await findConversationFolder(conversationRoot, id, facts)
+    if (conversation !== undefined) {
+      const bytes = await sizeOfDirectory(conversation.folder)
+      const entries = await readdir(conversation.folder, { withFileTypes: true }).catch(() => [])
+      base.conversationFolder = {
+        path: conversation.folder,
+        workspace: conversation.workspace,
+        base: conversation.base,
+        indexPath: conversation.indexPath,
+        bytes,
+        entries: entries.slice(0, 50).map((entry) => entry.name),
+        selected: options.conversationFolder === true,
+      }
+      if (options.conversationFolder === true) conversationBytes += bytes
+    }
     sessions.push(base)
+  }
+
+  if (options.conversationFolder === true) {
+    for (const session of sessions) {
+      const folder = session.conversationFolder?.path
+      if (folder === undefined) continue
+      for (const [key, candidate] of fileMap) {
+        if (isInside(candidate.path, folder)) fileMap.delete(key)
+      }
+    }
   }
 
   const sessionInfo = new Map(sessions.map((session) => [session.id, session]))
@@ -764,10 +927,11 @@ async function buildPreview(ctx, ids, options) {
     totals: {
       sessionBytes,
       projectionBytes,
+      conversationBytes,
       attachmentBytes,
       fileBytes,
       spillBytes,
-      totalBytes: sessionBytes + projectionBytes + attachmentBytes + fileBytes + spillBytes,
+      totalBytes: sessionBytes + projectionBytes + conversationBytes + attachmentBytes + fileBytes + spillBytes,
     },
     options,
     root,
@@ -1183,6 +1347,7 @@ function normaliseOptions(input) {
     workspaceFiles: options.workspaceFiles !== false,
     scanCreated: options.scanCreated !== false,
     spills: options.spills !== false,
+    conversationFolder: options.conversationFolder !== false,
     imageCache: options.imageCache === true,
   }
 }
@@ -1287,6 +1452,9 @@ async function resolveProjectPath(ctx, id) {
   } catch {
     return { path: fallback, source: 'header' }
   }
+  const conversationRoot = typeof workspacePath === 'string' && workspacePath.length > 0 ? workspacePath : headerCwd
+  const conversation = await findConversationFolder(conversationRoot, id, facts)
+  if (conversation !== undefined) return { path: conversation.folder, source: 'conversation' }
   if (facts.truncated === true) return { path: fallback, source: 'header' }
 
   const boundary = fallback
@@ -1323,9 +1491,15 @@ async function listArchived(ctx) {
   const snapshots = await ctx.sessionPersistence.list()
   const snapshotById = new Map(snapshots.map((snapshot) => [snapshot.header.id, snapshot]))
   const workspaceBySession = new Map()
+  const workspaceRoots = new Set()
   for (const workspace of registry.list()) {
+    workspaceRoots.add(workspace.path)
     for (const sessionId of workspace.sessionIds) workspaceBySession.set(sessionId, workspace)
   }
+  for (const snapshot of snapshots) {
+    if (typeof snapshot.header.cwd === 'string' && snapshot.header.cwd.length > 0) workspaceRoots.add(snapshot.header.cwd)
+  }
+  const conversationFolders = await indexConversationFolders([...workspaceRoots], archivedIds)
   let titles = new Map()
   try {
     const results = await ctx.sessionQuery.readTitleSnapshots(archivedIds)
@@ -1350,6 +1524,7 @@ async function listArchived(ctx) {
       live: ctx.sessions.get(id) !== undefined,
       missing: snapshot === undefined,
       workspace: workspace === undefined ? null : { title: workspace.title, path: workspace.path },
+      conversationFolder: conversationFolders.get(id)?.folder ?? null,
     }
   })
   sessions.sort((left, right) => {
@@ -1360,6 +1535,44 @@ async function listArchived(ctx) {
     sessions,
     totalBytes: sessions.reduce((sum, session) => sum + (session.sizeBytes || 0), 0),
   }
+}
+
+async function removeConversationIndexEntry(indexPath, id, warnings) {
+  const index = await readJsonFile(indexPath, undefined)
+  if (index === null || typeof index !== 'object' || Array.isArray(index)) return false
+  if (!Object.prototype.hasOwnProperty.call(index, id)) return false
+  const next = { ...index }
+  delete next[id]
+  const temporary = `${indexPath}.${process.pid}.${Date.now()}.tmp`
+  try {
+    await writeFile(temporary, `${JSON.stringify(next, null, 2)}\n`, 'utf8')
+    await rename(temporary, indexPath)
+    return true
+  } catch (error) {
+    try {
+      await unlink(temporary)
+    } catch {
+      /* no temporary file to clean */
+    }
+    warnings.push(`Conversation index ${indexPath}: could not remove ${id} (${formatError(error)}).`)
+    return false
+  }
+}
+
+async function removeConversationFolder(entry, id, warnings) {
+  const folder = resolve(entry.path ?? entry.folder)
+  const metadata = await readConversationMetadata(folder)
+  if (!isConversationFolderFor(folder, metadata, id, entry.workspace)) {
+    throw new Error('refusing to delete a folder whose session.json does not identify this Session')
+  }
+  const bytes = await sizeOfDirectory(folder)
+  try {
+    await rm(folder, { recursive: true, force: false, maxRetries: 3 })
+  } catch (error) {
+    if (!(error && error.code === 'ENOENT')) throw error
+  }
+  await removeConversationIndexEntry(entry.indexPath, id, warnings)
+  return { removed: true, bytes }
 }
 
 async function executeDeletion(ctx, body) {
@@ -1402,6 +1615,7 @@ async function executeDeletion(ctx, body) {
     sessions: { requested: selectedIds.size, removed: 0, missing: 0 },
     logs: { removed: 0, bytes: 0 },
     projection: { removed: 0, bytes: 0 },
+    conversation: { removed: 0, bytes: 0 },
     attachments: { removed: 0, bytes: 0, skipped: 0 },
     files: { removed: 0, bytes: 0, skipped: 0 },
     spills: { removed: 0, bytes: 0, skipped: 0 },
@@ -1434,6 +1648,28 @@ async function executeDeletion(ctx, body) {
       await ctx.workspaceRegistry.unarchiveSession(id)
     } catch (error) {
       report.errors.push({ scope: 'unarchive', id, message: formatError(error) })
+    }
+
+    if (options.conversationFolder === true && session.conversationFolder !== null) {
+      try {
+        const removal = await removeConversationFolder(session.conversationFolder, id, report.warnings)
+        report.conversation.removed += 1
+        report.conversation.bytes += removal.bytes
+      } catch (error) {
+        failedSessions.add(id)
+        report.errors.push({ scope: 'conversation-folder', id, message: formatError(error) })
+        try {
+          await ctx.workspaceRegistry.archiveSession(id, { stopActivity: true })
+        } catch (restoreError) {
+          report.errors.push({ scope: 'restore-archive', id, message: formatError(restoreError) })
+        }
+        try {
+          if (workspace !== undefined) await workspace.attachSession(id)
+        } catch {
+          /* the Session stays ungrouped rather than losing its folder */
+        }
+        continue
+      }
     }
 
     const projection = await removeProjectionCache(ctx, id, report.warnings)

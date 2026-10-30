@@ -42,6 +42,8 @@ window.__ModuleLoader__.load({
         openWorkspaceFailed: '无法打开目录：{message}',
         noWorkspacePath: '该会话没有可打开的工作目录',
         optionsTitle: '清理范围',
+        optConversationFolder: '删除会话专用目录',
+        optConversationFolderHint: '删除 session-archive 为每个对话创建的 conversations/<时间_标题>/ 目录，包括 work、out、session.json 与 AGENTS.md 副本；同时移除 index.json 中的映射。',
         optAttachments: '删除仅被这些会话引用的附件',
         optAttachmentsHint: '删除前会扫描其余会话；仍被引用的附件会保留。只检查会话日志中的引用，未提交草稿或外部程序的引用无法检测。',
         optFiles: '删除这些会话在工作区产生的文件',
@@ -67,6 +69,10 @@ window.__ModuleLoader__.load({
         noSpills: '没有发现该会话的溢出文件目录。',
         logDir: '日志目录',
         logFiles: '文件：{names}',
+        conversationFolder: '会话目录',
+        conversationFolderSelected: '将整目录删除',
+        conversationFolderKept: '保留目录',
+        noConversationFolder: '未检测到对话专用目录',
         projectionCache: '投影检查点',
         noProjection: '无检查点',
         readError: '日志读取失败：{message}',
@@ -98,6 +104,7 @@ window.__ModuleLoader__.load({
         totals: '合计',
         sessionBytes: '会话日志',
         projectionBytes: '投影检查点',
+        conversationBytes: '会话目录',
         attachmentBytes: '附件',
         fileBytes: '工作区文件',
         spillBytes: '工具输出临时文件',
@@ -111,7 +118,7 @@ window.__ModuleLoader__.load({
         deleting: '正在删除…',
         deleteFailed: '删除失败：{message}',
         resultTitle: '清理完成',
-        resultSummary: '已处理 {sessions} 个会话，删除日志 {logs} 份、检查点 {projections} 份、附件 {attachments} 个、工作区文件 {files} 个、工具输出临时目录 {spills} 个，共释放 {bytes}。',
+        resultSummary: '已处理 {sessions} 个会话，删除日志 {logs} 份、检查点 {projections} 份、会话目录 {folders} 个、附件 {attachments} 个、工作区文件 {files} 个、工具输出临时目录 {spills} 个，共释放 {bytes}。',
         resultMissing: '其中 {count} 个会话的日志此前已缺失，只清理了归档记录。',
         resultImageCache: '附件请求缓存已清空（{bytes}）。',
         resultErrors: '未完成的项目',
@@ -147,6 +154,8 @@ window.__ModuleLoader__.load({
         openWorkspaceFailed: 'Could not open the directory: {message}',
         noWorkspacePath: 'This Session has no openable working directory.',
         optionsTitle: 'Cleanup scope',
+        optConversationFolder: 'Delete the per-Session conversation folder',
+        optConversationFolderHint: 'Removes the conversations/<timestamp_title>/ folder created by session-archive, including work, out, session.json, and the AGENTS.md copy; its index.json entry is removed too.',
         optAttachments: 'Delete attachments referenced only by these Sessions',
         optAttachmentsHint: 'The remaining Sessions are scanned first; an attachment still referenced elsewhere is kept. Only Session-log references are checked; drafts and external programs are not visible.',
         optFiles: 'Delete files these Sessions produced in the workspace',
@@ -172,6 +181,10 @@ window.__ModuleLoader__.load({
         noSpills: 'No spill directory was found for this Session.',
         logDir: 'Log directory',
         logFiles: 'Files: {names}',
+        conversationFolder: 'Conversation folder',
+        conversationFolderSelected: 'whole folder will be deleted',
+        conversationFolderKept: 'folder kept',
+        noConversationFolder: 'No per-conversation folder detected',
         projectionCache: 'Projection checkpoint',
         noProjection: 'No checkpoint',
         readError: 'Log read failed: {message}',
@@ -203,6 +216,7 @@ window.__ModuleLoader__.load({
         totals: 'Totals',
         sessionBytes: 'Session logs',
         projectionBytes: 'Checkpoints',
+        conversationBytes: 'Conversation folder',
         attachmentBytes: 'Attachments',
         fileBytes: 'Workspace files',
         spillBytes: 'Spilled tool output',
@@ -216,7 +230,7 @@ window.__ModuleLoader__.load({
         deleting: 'Deleting…',
         deleteFailed: 'Deletion failed: {message}',
         resultTitle: 'Cleanup complete',
-        resultSummary: 'Processed {sessions} Session(s), removed {logs} log(s), {projections} checkpoint(s), {attachments} attachment(s), {files} workspace file(s), and {spills} spill director(ies), freeing {bytes}.',
+        resultSummary: 'Processed {sessions} Session(s), removed {logs} log(s), {projections} checkpoint(s), {folders} conversation folder(s), {attachments} attachment(s), {files} workspace file(s), and {spills} spill director(ies), freeing {bytes}.',
         resultMissing: '{count} Session log(s) were already missing; only archive records were cleaned.',
         resultImageCache: 'The attachment request cache was cleared ({bytes}).',
         resultErrors: 'Items not completed',
@@ -506,7 +520,7 @@ window.__ModuleLoader__.load({
         meta.push(formatDate(session.createdAt))
         if (session.sizeBytes) meta.push(formatBytes(session.sizeBytes))
         if (session.eventCount) meta.push(t('messages', { count: session.eventCount }))
-        const openPath = session.cwd || (session.workspace && session.workspace.path)
+        const openPath = session.conversationFolder || session.cwd || (session.workspace && session.workspace.path)
         return h(
           'div',
           { style: { ...STYLE.row, ...(props.last ? STYLE.rowLast : {}) } },
@@ -626,6 +640,7 @@ window.__ModuleLoader__.load({
         const [sessions, setSessions] = useState([])
         const [selected, setSelected] = useState(() => new Set())
         const [options, setOptions] = useState({
+          conversationFolder: true,
           attachments: true,
           workspaceFiles: true,
           scanCreated: true,
@@ -680,11 +695,15 @@ window.__ModuleLoader__.load({
           setOpenError(null)
           const paths = []
           let resolvedPath
+          if (typeof session.conversationFolder === 'string' && session.conversationFolder.length > 0) {
+            resolvedPath = session.conversationFolder
+            paths.push(resolvedPath)
+          }
           try {
             const resolved = await callApi('project-path', { sessionId: session.id })
             if (resolved && typeof resolved.path === 'string' && resolved.path.length > 0) {
-              resolvedPath = resolved.path
-              paths.push(resolvedPath)
+              if (resolvedPath === undefined) resolvedPath = resolved.path
+              paths.push(resolved.path)
             }
           } catch {
             /* an older Host or a transient read failure falls back to stored paths */
@@ -903,6 +922,12 @@ window.__ModuleLoader__.load({
               'div',
               { style: STYLE.cardBody },
               h(OptionRow, {
+                checked: options.conversationFolder,
+                onChange: (value) => setOption('conversationFolder', value),
+                title: t('optConversationFolder'),
+                hint: t('optConversationFolderHint'),
+              }),
+              h(OptionRow, {
                 checked: options.attachments,
                 onChange: (value) => setOption('attachments', value),
                 title: t('optAttachments'),
@@ -975,6 +1000,7 @@ window.__ModuleLoader__.load({
                 { style: STYLE.grid },
                 stat(t('sessionBytes'), formatBytes(preview.totals.sessionBytes)),
                 stat(t('projectionBytes'), formatBytes(preview.totals.projectionBytes)),
+                stat(t('conversationBytes'), formatBytes(preview.totals.conversationBytes || 0)),
                 stat(t('attachmentBytes'), formatBytes(preview.totals.attachmentBytes)),
                 stat(t('fileBytes'), formatBytes(preview.totals.fileBytes)),
                 stat(t('spillBytes'), formatBytes(preview.totals.spillBytes || 0)),
@@ -996,6 +1022,13 @@ window.__ModuleLoader__.load({
                     session.projectionCache && session.projectionCache.exists
                       ? h('div', { style: STYLE.meta }, `${t('projectionCache')}: ${session.projectionCache.path} · ${formatBytes(session.projectionCache.bytes)}`)
                       : h('div', { style: STYLE.meta }, t('noProjection')),
+                    session.conversationFolder
+                      ? h('div', { style: STYLE.meta },
+                          `${t('conversationFolder')}: ${session.conversationFolder.path} · ${formatBytes(session.conversationFolder.bytes)} · ${session.conversationFolder.selected ? t('conversationFolderSelected') : t('conversationFolderKept')}`)
+                      : h('div', { style: STYLE.meta }, t('noConversationFolder')),
+                    session.conversationFolder && (session.conversationFolder.entries || []).length > 0
+                      ? h('div', { style: STYLE.mono }, session.conversationFolder.entries.join(' · '))
+                      : null,
                     session.readError ? h('div', { style: STYLE.warn }, t('readError', { message: session.readError })) : null,
                   ),
                 ),
@@ -1168,10 +1201,11 @@ window.__ModuleLoader__.load({
                     sessions: report.sessions.removed,
                     logs: report.logs.removed,
                     projections: report.projection.removed,
+                    folders: report.conversation ? report.conversation.removed : 0,
                     attachments: report.attachments.removed,
                     files: report.files.removed,
                     spills: report.spills ? report.spills.removed : 0,
-                    bytes: formatBytes(report.logs.bytes + report.projection.bytes + report.attachments.bytes + report.files.bytes + (report.spills ? report.spills.bytes : 0)),
+                    bytes: formatBytes(report.logs.bytes + report.projection.bytes + (report.conversation ? report.conversation.bytes : 0) + report.attachments.bytes + report.files.bytes + (report.spills ? report.spills.bytes : 0)),
                   })),
                   report.sessions.missing > 0 ? h('p', { style: STYLE.meta }, t('resultMissing', { count: report.sessions.missing })) : null,
                   report.imageCache && report.imageCache.removed ? h('p', { style: STYLE.meta }, t('resultImageCache', { bytes: formatBytes(report.imageCache.bytes) })) : null,

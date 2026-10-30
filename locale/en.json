@@ -1,6 +1,6 @@
 {
   "meta": {
     "title": "Session Cleanup",
-    "description": "Preview and permanently delete archived Sessions, their attachment references, and the files they produced."
+    "description": "Preview and permanently delete archived Sessions, their per-conversation folders, attachment references, and workspace files."
   }
 }

@@ -7,7 +7,7 @@
  * user confirmation. The browser half never supplies an authoritative path: it
  * may only choose among candidates this half re-derives at deletion time.
  */
-import { createHash } from 'node:crypto'
+import { createHash, randomBytes } from 'node:crypto'
 import { homedir, tmpdir } from 'node:os'
 import {
   basename,
@@ -50,11 +50,15 @@ const MAX_SCAN_DEPTH = 4
 const MAX_FILE_CANDIDATES = 500
 const MAX_REFERENCE_SESSIONS = 400
 const FACT_CACHE_TTL_MS = 5 * 60 * 1000
+const MAX_FACT_CACHE = 200
+const PREVIEW_TOKEN_TTL_MS = 15 * 60 * 1000
+const MAX_PREVIEW_TOKENS = 50
 const PAGE_EVENTS = 500
 const MAX_EVENTS_PER_SESSION = 100000
 const CONVERSATION_BASE = 'conversations'
 const CONVERSATION_METADATA = 'session.json'
 const CONVERSATION_INDEX = 'index.json'
+const KNOWN_FOLDER_ENTRIES = new Set(['work', 'out', CONVERSATION_METADATA, 'AGENTS.md'])
 
 const SKIP_DIRS = new Set([
   '.git',
@@ -152,6 +156,28 @@ function pathKey(path) {
   return process.platform === 'win32' ? normal.toLowerCase() : normal
 }
 
+/**
+ * Reject paths that reach their target through a symlink or Windows junction.
+ * Checking only the final component is insufficient: deleting
+ * `workspace/link/secret.txt` follows `link` even when the file itself is not a
+ * symlink. The boundary itself is trusted; it comes from the workspace registry
+ * or from a validated persistence root.
+ */
+async function hasSymlinkAncestor(path, boundary) {
+  if (typeof path !== 'string' || typeof boundary !== 'string') return false
+  const stop = resolve(boundary)
+  let current = resolve(path)
+  if (!isInside(current, stop)) return false
+  while (isInside(current, stop)) {
+    const parent = dirname(current)
+    if (samePath(parent, stop)) break
+    const info = await lstatSafe(parent)
+    if (info !== undefined && info.isSymbolicLink()) return true
+    current = parent
+  }
+  return false
+}
+
 function formatError(error) {
   return error instanceof Error ? error.message : String(error)
 }
@@ -176,10 +202,8 @@ function isConversationFolderFor(folder, metadata, id, workspaceRoot) {
   const resolvedFolder = resolve(folder)
   const resolvedRoot = resolve(workspaceRoot)
   if (samePath(resolvedFolder, resolvedRoot) || !isInside(resolvedFolder, resolvedRoot)) return false
-  const base = dirname(resolvedFolder)
-  if (!samePath(dirname(base), resolvedRoot)) return false
   const recorded = metadata.folder
-  const matchesName = safeConversationName(recorded) && samePath(join(base, recorded), resolvedFolder)
+  const matchesName = safeConversationName(recorded) && basename(resolvedFolder) === recorded
   const matchesAbsolute = typeof recorded === 'string' && recorded.length > 0 && samePath(recorded, resolvedFolder)
   if (!matchesName && !matchesAbsolute) return false
   return true
@@ -243,9 +267,9 @@ async function conversationFromFacts(workspaceRoot, id, facts) {
 
 async function findConversationFolder(workspaceRoot, id, facts) {
   if (workspaceRoot === undefined) return undefined
-  const fromFacts = await conversationFromFacts(workspaceRoot, id, facts)
-  if (fromFacts !== undefined) return fromFacts
-  return await conversationFromIndex(workspaceRoot, id)
+  const fromIndex = await conversationFromIndex(workspaceRoot, id)
+  if (fromIndex !== undefined) return fromIndex
+  return await conversationFromFacts(workspaceRoot, id, facts)
 }
 
 async function indexConversationFolders(workspaceRoots, ids) {
@@ -444,6 +468,8 @@ function isProtectedPath(path) {
   const resolved = resolve(path)
   if (/(^|[\\/])\.(git|hg|svn)([\\/]|$)/i.test(resolved)) return true
   if (/(^|[\\/])session\.[^\\/]*\.jsonl(\.zstd)?$/i.test(resolved)) return true
+  if (/(^|[\\/])session\.json$/i.test(resolved)) return true
+  if (/(^|[\\/])conversations[\\/]index\.json$/i.test(resolved)) return true
   if (/(^|[\\/])(workspace\.json|settings\.yaml|\.credentials[^\\/]*)$/i.test(resolved)) return true
   for (const prefix of protectedPrefixes()) {
     if (samePath(resolved, prefix) || isInside(resolved, prefix)) return true
@@ -647,6 +673,9 @@ async function removeSpillDirectory(ctx, entry) {
   if (!samePath(dirname(entry.directory), entry.root)) {
     throw new Error('refusing to delete a spill directory outside its root')
   }
+  if (await hasSymlinkAncestor(entry.directory, entry.root)) {
+    throw new Error('refusing to delete a spill directory reached through a symlink or junction')
+  }
   const bytes = await sizeOfDirectory(entry.directory)
   await rm(entry.directory, { recursive: true, force: false, maxRetries: 3 })
   return { removed: true, bytes }
@@ -663,19 +692,29 @@ function cacheKey(id) {
 }
 
 function cachedFacts(id, revision) {
-  const entry = factCache.get(cacheKey(id))
+  const key = cacheKey(id)
+  const entry = factCache.get(key)
   if (entry === undefined) return undefined
   if (entry.revision !== revision) return undefined
   if (Date.now() - entry.time > FACT_CACHE_TTL_MS) {
-    factCache.delete(cacheKey(id))
+    factCache.delete(key)
     return undefined
   }
+  factCache.delete(key)
+  factCache.set(key, entry)
   return entry
 }
 
 function rememberFacts(id, revision, facts) {
   if (typeof revision !== 'string' && typeof revision !== 'number') return
-  factCache.set(cacheKey(id), { revision, facts, time: Date.now() })
+  const key = cacheKey(id)
+  factCache.delete(key)
+  while (factCache.size >= MAX_FACT_CACHE) {
+    const oldest = factCache.keys().next().value
+    if (oldest === undefined) break
+    factCache.delete(oldest)
+  }
+  factCache.set(key, { revision, facts, time: Date.now() })
 }
 
 async function factsFor(ctx, id, revision, headerCwd) {
@@ -735,6 +774,9 @@ async function buildPreview(ctx, ids, options) {
   const attachments = new Map()
   const fileMap = new Map()
   const warnings = []
+  if (options.imageCache === true) {
+    warnings.push('The attachment request-image cache is shared by every Session; clearing it affects all Sessions. It is rebuildable and does not remove durable attachments.')
+  }
   const unreadable = new Set()
   let sessionBytes = 0
   let projectionBytes = 0
@@ -811,56 +853,110 @@ async function buildPreview(ctx, ids, options) {
     if (conversation !== undefined) {
       const bytes = await sizeOfDirectory(conversation.folder)
       const entries = await readdir(conversation.folder, { withFileTypes: true }).catch(() => [])
+      const names = entries.map((entry) => entry.name)
+      const splitLayout = names.includes('work') || names.includes('out')
+      const unknownEntries = splitLayout
+        ? names.filter((name) => !KNOWN_FOLDER_ENTRIES.has(name))
+        : []
       base.conversationFolder = {
         path: conversation.folder,
         workspace: conversation.workspace,
         base: conversation.base,
         indexPath: conversation.indexPath,
         bytes,
-        entries: entries.slice(0, 50).map((entry) => entry.name),
-        selected: options.conversationFolder === true,
+        entries: names.slice(0, 50),
+        entryCount: names.length,
+        unknownEntries: unknownEntries.slice(0, 50),
+        unknownCount: unknownEntries.length,
+        layout: splitLayout ? 'split' : 'flat',
+        allowUnknown: options.allowUnknownFolderEntries === true,
+        sharedWith: [],
+        referencesUnknown: false,
+        deletable: false,
+        selected: false,
+        reason: undefined,
+        reasonCode: undefined,
       }
-      if (options.conversationFolder === true) conversationBytes += bytes
     }
     sessions.push(base)
   }
 
-  if (options.conversationFolder === true) {
-    for (const session of sessions) {
-      const folder = session.conversationFolder?.path
-      if (folder === undefined) continue
-      for (const [key, candidate] of fileMap) {
-        if (isInside(candidate.path, folder)) fileMap.delete(key)
-      }
-    }
-  }
-
   const sessionInfo = new Map(sessions.map((session) => [session.id, session]))
-  await enrichFileCandidates(fileMap, sessionInfo)
   const spills = options.spills === true ? await findSpillDirectories(ctx, unique) : []
   const spillBytes = spills.reduce((sum, spill) => sum + spill.bytes, 0)
   if (fileMap.size >= MAX_FILE_CANDIDATES) {
     warnings.push(`The workspace file list stopped at ${MAX_FILE_CANDIDATES} candidates. Narrow the selection or inspect the workspace manually.`)
   }
 
-  /* Attachment references from every Session that stays behind. */
+  /* References from every Session that stays behind. Folder users are checked
+     too: subagents and forks can share a parent conversation folder. */
   let remainingUnreadable = false
   let attachmentIndex = new Map()
+  let folderIndex = new Map()
+  let childrenByParent = new Map()
   const pathIndex = new Map()
+  const hasConversationFolders = sessions.some((session) => session.conversationFolder !== null)
   const needsReferenceScan = (options.attachments === true && attachments.size > 0) ||
-    (options.workspaceFiles === true && fileMap.size > 0)
+    (options.workspaceFiles === true && fileMap.size > 0) ||
+    (options.conversationFolder === true && hasConversationFolders)
   if (needsReferenceScan) {
     if (snapshots.length - unique.length > MAX_REFERENCE_SESSIONS) {
-      warnings.push(`There are more than ${MAX_REFERENCE_SESSIONS} remaining Sessions; attachment sharing was not checked. Attachments will be kept.`)
+      warnings.push(`There are more than ${MAX_REFERENCE_SESSIONS} remaining Sessions; attachment, workspace-file, and conversation-folder sharing was not checked. Unsafe items will be kept.`)
       remainingUnreadable = true
     } else {
       const remaining = snapshots.filter((snapshot) => !unique.includes(snapshot.header.id))
       const indexed = await indexRemainingSessions(ctx, remaining, warnings)
       remainingUnreadable = indexed.unreadable
       attachmentIndex = indexed.attachments
+      folderIndex = indexed.folders
+      childrenByParent = indexed.children
       for (const [path, sessionIds] of indexed.paths) pathIndex.set(path, sessionIds)
     }
   }
+
+  /* Decide whether each conversation folder is safe to remove as a whole. */
+  for (const session of sessions) {
+    const folder = session.conversationFolder
+    if (folder === null) continue
+    const users = new Set(folderIndex.get(pathKey(folder.path)) ?? [])
+    for (const childId of childrenByParent.get(session.id) ?? []) users.add(childId)
+    folder.sharedWith = [...users].filter((id) => !unique.includes(id))
+    folder.referencesUnknown = remainingUnreadable
+    const unknownBlocked = folder.unknownCount > 0 && folder.allowUnknown !== true
+    folder.deletable = folder.sharedWith.length === 0 && !folder.referencesUnknown && !unknownBlocked
+    if (folder.sharedWith.length > 0) {
+      folder.reasonCode = 'shared'
+      folder.reason = `Still used by ${folder.sharedWith.length} other Session(s).`
+    } else if (folder.referencesUnknown) {
+      folder.reasonCode = 'references-unknown'
+      folder.reason = 'A remaining Session log could not be read, so folder sharing is unknown.'
+    } else if (unknownBlocked) {
+      folder.reasonCode = 'unknown-entries'
+      folder.reason = `The folder contains ${folder.unknownCount} unexpected top-level entr${folder.unknownCount === 1 ? 'y' : 'ies'}.`
+    }
+    folder.selected = options.conversationFolder === true && folder.deletable
+    if (folder.selected) conversationBytes += folder.bytes
+  }
+
+  /* Files inside a folder that will be removed are not listed twice. Files in a
+     shared folder whose references are unknown must not be deleted one by one. */
+  for (const session of sessions) {
+    const folder = session.conversationFolder
+    if (folder === null) continue
+    for (const [key, candidate] of fileMap) {
+      if (!isInside(candidate.path, folder.path)) continue
+      if (folder.selected) {
+        fileMap.delete(key)
+      } else if (folder.reasonCode === 'shared' || folder.reasonCode === 'references-unknown') {
+        candidate.referencesUnknown = true
+        candidate.reasonCode = 'shared-folder'
+        candidate.reason = 'The containing conversation folder is still used by another Session.'
+        candidate.selectedByDefault = false
+      }
+    }
+  }
+
+  await enrichFileCandidates(fileMap, sessionInfo)
 
   const attachmentList = []
   if (options.attachments === true) {
@@ -900,14 +996,30 @@ async function buildPreview(ctx, ids, options) {
 
   for (const [path, candidate] of fileMap) {
     const users = pathIndex.get(path)
-    const sharedWith = users === undefined ? [] : [...users].filter((id) => !unique.includes(id))
-    if (sharedWith.length > 0) {
-      candidate.sharedWith = sharedWith
-      candidate.selectedByDefault = false
+    candidate.sharedWith = users === undefined ? [] : [...users].filter((id) => !unique.includes(id))
+    if (remainingUnreadable) candidate.referencesUnknown = true
+    if (candidate.protected === true) {
+      candidate.reasonCode ??= 'protected'
+      candidate.reason ??= 'Protected; will not be deleted.'
+    } else if (candidate.outsideWorkspace === true) {
+      candidate.reasonCode = 'outside-workspace'
+      candidate.reason = 'Outside the Session workspace; will not be deleted.'
+    } else if (candidate.referencesUnknown === true) {
+      candidate.reasonCode ??= 'references-unknown'
+      candidate.reason ??= 'A remaining Session log could not be read, so sharing is unknown.'
+    } else if (candidate.sharedWith.length > 0) {
+      candidate.reasonCode = 'shared'
+      candidate.reason = 'Still referenced by another Session.'
     }
-    if (candidate.protected === true || candidate.exists !== true || candidate.outsideWorkspace === true) {
-      candidate.selectedByDefault = false
-    }
+    candidate.deletable = candidate.exists === true &&
+      candidate.protected !== true &&
+      candidate.outsideWorkspace !== true &&
+      candidate.referencesUnknown !== true &&
+      candidate.sharedWith.length === 0
+    candidate.selectedByDefault = candidate.deletable &&
+      candidate.createdDuring === true &&
+      candidate.origins.some((origin) => origin !== 'scan')
+    if (candidate.deletable !== true) candidate.selectedByDefault = false
   }
 
   const files = [...fileMap.values()].sort((left, right) => left.path.localeCompare(right.path))
@@ -956,11 +1068,15 @@ function addFileCandidate(fileMap, file, session, options, scanned) {
     sizeBytes: 0,
     createdDuring: false,
     selectedByDefault: false,
+    deletable: false,
     outsideWorkspace: false,
+    referencesUnknown: false,
     sharedWith: [],
     protected: false,
     exists: false,
     scanned: scanned === true,
+    reason: undefined,
+    reasonCode: undefined,
   })
 }
 
@@ -1018,23 +1134,40 @@ async function scanCreatedFiles(root, session, fileMap, options, warnings) {
 async function indexRemainingSessions(ctx, snapshots, warnings) {
   const attachments = new Map()
   const paths = new Map()
+  const folders = new Map()
+  const children = new Map()
   let unreadable = false
   let index = 0
   const workers = Array.from({ length: Math.min(4, snapshots.length) }, async () => {
     while (index < snapshots.length) {
       const current = snapshots[index]
       index += 1
+      if (typeof current.header.parentSession === 'string') {
+        const list = children.get(current.header.parentSession) ?? []
+        list.push(current.header.id)
+        children.set(current.header.parentSession, list)
+      }
       let facts
       try {
-        facts = await factsFor(ctx, current.header.id, current.revision, current.header.cwd)
+        const live = ctx.sessions.get(current.header.id)
+        if (live !== undefined) {
+          const events = live.snapshotEvents()
+          if (events.length >= MAX_EVENTS_PER_SESSION) {
+            throw new Error(`live event log reaches the ${MAX_EVENTS_PER_SESSION}-event scan limit`)
+          }
+          facts = extractFacts(events, current.header.cwd)
+          facts.truncated = false
+        } else {
+          facts = await factsFor(ctx, current.header.id, current.revision, current.header.cwd)
+        }
       } catch (error) {
         unreadable = true
-        warnings.push(`Session ${current.header.id}: its event log could not be read (${formatError(error)}); shared attachments cannot be proven safe to delete.`)
+        warnings.push(`Session ${current.header.id}: its event log could not be read (${formatError(error)}); shared attachments, files, and folders cannot be proven safe to delete.`)
         continue
       }
       if (facts.truncated === true) {
         unreadable = true
-        warnings.push(`Session ${current.header.id}: its event log exceeds ${MAX_EVENTS_PER_SESSION} events; shared attachments cannot be proven safe to delete.`)
+        warnings.push(`Session ${current.header.id}: its event log exceeds ${MAX_EVENTS_PER_SESSION} events; shared attachments, files, and folders cannot be proven safe to delete.`)
         continue
       }
       for (const attachment of facts.attachments.values()) {
@@ -1048,10 +1181,16 @@ async function indexRemainingSessions(ctx, snapshots, warnings) {
         if (users === undefined) paths.set(key, new Set([current.header.id]))
         else users.add(current.header.id)
       }
+      for (const cwd of facts.cwdHistory) {
+        const key = pathKey(cwd)
+        const users = folders.get(key)
+        if (users === undefined) folders.set(key, new Set([current.header.id]))
+        else users.add(current.header.id)
+      }
     }
   })
   await Promise.all(workers)
-  return { attachments, paths, unreadable }
+  return { attachments, paths, folders, children, unreadable }
 }
 
 function isWithin(path, root) {
@@ -1066,6 +1205,8 @@ async function enrichFileCandidates(fileMap, sessionInfo) {
       candidate.sizeBytes = 0
       candidate.protected = true
       candidate.reason = 'missing'
+      candidate.reasonCode = 'missing'
+      candidate.deletable = false
       candidate.selectedByDefault = false
       candidate.sessionIds = [...candidate.sessionIds]
       candidate.origins = [...candidate.origins]
@@ -1076,6 +1217,8 @@ async function enrichFileCandidates(fileMap, sessionInfo) {
     if (info.isSymbolicLink()) {
       candidate.protected = true
       candidate.reason = 'symlink'
+      candidate.reasonCode = 'symlink'
+      candidate.deletable = false
       candidate.selectedByDefault = false
       candidate.sessionIds = [...candidate.sessionIds]
       candidate.origins = [...candidate.origins]
@@ -1084,6 +1227,8 @@ async function enrichFileCandidates(fileMap, sessionInfo) {
     if (!info.isFile()) {
       candidate.protected = true
       candidate.reason = 'not-a-regular-file'
+      candidate.reasonCode = 'not-a-regular-file'
+      candidate.deletable = false
       candidate.selectedByDefault = false
       candidate.sessionIds = [...candidate.sessionIds]
       candidate.origins = [...candidate.origins]
@@ -1092,6 +1237,8 @@ async function enrichFileCandidates(fileMap, sessionInfo) {
     if (isProtectedPath(candidate.path)) {
       candidate.protected = true
       candidate.reason = 'protected'
+      candidate.reasonCode = 'protected'
+      candidate.deletable = false
       candidate.selectedByDefault = false
       candidate.sessionIds = [...candidate.sessionIds]
       candidate.origins = [...candidate.origins]
@@ -1122,11 +1269,17 @@ async function enrichFileCandidates(fileMap, sessionInfo) {
     candidate.workspaceRoot = containing[0]
     candidate.outsideWorkspace = containing.length === 0
 
-    const explicit = [...candidate.origins].some((origin) => origin !== 'scan')
-    candidate.selectedByDefault = candidate.protected !== true &&
-      candidate.outsideWorkspace !== true &&
-      candidate.createdDuring === true &&
-      explicit === true
+    if (candidate.workspaceRoot !== undefined) {
+      const boundaryInfo = await lstatSafe(candidate.workspaceRoot)
+      if ((boundaryInfo !== undefined && boundaryInfo.isSymbolicLink()) ||
+          await hasSymlinkAncestor(candidate.path, candidate.workspaceRoot)) {
+        candidate.protected = true
+        candidate.reason = 'symlink-ancestor'
+        candidate.reasonCode = 'symlink-ancestor'
+        candidate.deletable = false
+        candidate.selectedByDefault = false
+      }
+    }
 
     candidate.sessionIds = sessionIds
     candidate.origins = [...candidate.origins]
@@ -1140,26 +1293,31 @@ async function enrichFileCandidates(fileMap, sessionInfo) {
 
 async function removeProjectionCache(ctx, id, warnings) {
   const path = projectionCachePath(id)
+  if (await hasSymlinkAncestor(path, join(homeDirectory(), 'storages'))) {
+    warnings.push(`Projection checkpoint ${id}: path crosses a symlink or junction; kept.`)
+    return { removed: false, bytes: 0, path }
+  }
   const bytes = await sizeOfFile(path)
   let removed = false
   try {
     const domain = typeof ctx.storageDomain.get === 'function' ? ctx.storageDomain.get('session_projcache') : undefined
     const table = domain !== undefined && typeof domain.table === 'function' ? domain.table('sessions') : undefined
     if (table !== undefined && typeof table.delete === 'function') {
-      await table.delete(id)
-      removed = true
+      removed = (await table.delete(id)) === true
     }
   } catch (error) {
     warnings.push(`Projection checkpoint ${id}: domain deletion failed (${formatError(error)}); removing the file directly.`)
   }
-  if (removed === false) {
-    try {
-      await unlink(path)
-      removed = true
-    } catch (error) {
-      if (!(error && error.code === 'ENOENT')) {
-        warnings.push(`Projection checkpoint ${id}: ${formatError(error)}`)
-      }
+  /* A false return means the domain had no record. The file may still exist
+     (for example after an invalid-record backup was skipped), so always fall
+     back to the direct path instead of trusting the boolean alone. */
+  try {
+    await unlink(path)
+    removed = true
+  } catch (error) {
+    if (!(error && error.code === 'ENOENT')) {
+      removed = false
+      warnings.push(`Projection checkpoint ${id}: ${formatError(error)}`)
     }
   }
   let backupBytes = 0
@@ -1186,6 +1344,14 @@ async function removeProjectionCache(ctx, id, warnings) {
 async function removeSessionDirectory(root, directory, id) {
   if (directory === undefined) return { removed: false, reason: 'missing' }
   assertOwnedSessionDirectory(root, directory, id)
+  const info = await lstatSafe(directory)
+  if (info === undefined) return { removed: false, reason: 'missing' }
+  if (!info.isDirectory() || info.isSymbolicLink()) {
+    throw new Error('refusing to delete a Session directory that is not a real directory')
+  }
+  if (await hasSymlinkAncestor(directory, root)) {
+    throw new Error('refusing to delete a Session directory reached through a symlink or junction')
+  }
   const bytes = await sizeOfDirectory(directory)
   const project = dirname(directory)
   try {
@@ -1221,6 +1387,12 @@ async function removeAttachment(ctx, attachment) {
   if (paths === undefined) {
     return { removed: false, bytes: 0, reason: 'unrecognised attachment id' }
   }
+  const attachmentRoot = join(homeDirectory(), 'attachments', 'v1')
+  for (const path of [paths.imageObject, paths.fileObject, paths.fileReference]) {
+    if (await hasSymlinkAncestor(path, attachmentRoot)) {
+      throw new Error('refusing to delete an attachment reached through a symlink or junction')
+    }
+  }
   let bytes = 0
   let removed = false
   const removeFile = async (path) => {
@@ -1234,11 +1406,15 @@ async function removeAttachment(ctx, attachment) {
   /* A digest may have been admitted as an image and later as a generic file;
      the reference check already proved that no remaining Session names it. */
   await removeFile(paths.imageObject)
+  const referenceInfo = await lstatSafe(paths.fileReference)
+  if (referenceInfo !== undefined && referenceInfo.isSymbolicLink()) {
+    throw new Error('refusing to delete a file-reference directory that is a symlink')
+  }
   const referenceBytes = await sizeOfDirectory(paths.fileReference)
   try {
     await rm(paths.fileReference, { recursive: true, force: true })
-    if (referenceBytes > 0) {
-      bytes += referenceBytes
+    if (referenceInfo !== undefined) {
+      bytes += referenceInfo.isFile() ? referenceInfo.size : referenceBytes
       removed = true
     }
   } catch (error) {
@@ -1273,6 +1449,14 @@ async function pruneEmptyParents(file, boundary) {
 }
 
 async function removeFileCandidate(candidate, warnings) {
+  if (candidate.deletable !== true) {
+    return { removed: false, bytes: 0, reason: candidate.reasonCode ?? 'not-deletable' }
+  }
+  if (candidate.outsideWorkspace === true ||
+      candidate.referencesUnknown === true ||
+      (candidate.sharedWith !== undefined && candidate.sharedWith.length > 0)) {
+    return { removed: false, bytes: 0, reason: candidate.reasonCode ?? 'unsafe' }
+  }
   let info
   try {
     info = await lstat(candidate.path)
@@ -1283,6 +1467,13 @@ async function removeFileCandidate(candidate, warnings) {
   if (info.isSymbolicLink()) return { removed: false, bytes: 0, reason: 'symlink' }
   if (!info.isFile()) return { removed: false, bytes: 0, reason: 'not-a-regular-file' }
   if (isProtectedPath(candidate.path)) return { removed: false, bytes: 0, reason: 'protected' }
+  if (candidate.workspaceRoot !== undefined) {
+    const boundaryInfo = await lstatSafe(candidate.workspaceRoot)
+    if ((boundaryInfo !== undefined && boundaryInfo.isSymbolicLink()) ||
+        await hasSymlinkAncestor(candidate.path, candidate.workspaceRoot)) {
+      return { removed: false, bytes: 0, reason: 'symlink-ancestor' }
+    }
+  }
   const bytes = info.size
   await unlink(candidate.path)
   const boundary = candidate.workspaceRoot
@@ -1294,6 +1485,14 @@ async function removeFileCandidate(candidate, warnings) {
 
 async function clearImageCache() {
   const directory = join(homeDirectory(), 'cache', 'attachments', 'request-images')
+  const info = await lstatSafe(directory)
+  if (info === undefined) return { removed: false, bytes: 0 }
+  if (!info.isDirectory() || info.isSymbolicLink()) {
+    throw new Error('refusing to clear an image cache that is not a real directory')
+  }
+  if (await hasSymlinkAncestor(directory, join(homeDirectory(), 'cache'))) {
+    throw new Error('refusing to clear an image cache reached through a symlink or junction')
+  }
   const bytes = await sizeOfDirectory(directory)
   try {
     await rm(directory, { recursive: true, force: true })
@@ -1314,6 +1513,66 @@ class HttpError extends Error {
     this.status = status
     this.code = code
   }
+}
+
+const previewTokens = new Map()
+
+function previewFingerprint(preview) {
+  const sessions = (preview.sessions || [])
+    .map((session) => [
+      session.id,
+      session.conversationFolder?.path ?? null,
+      session.conversationFolder?.deletable === true,
+      session.conversationFolder?.sharedWith?.length ?? 0,
+      session.conversationFolder?.unknownCount ?? 0,
+    ])
+    .sort((left, right) => String(left[0]).localeCompare(String(right[0])))
+  const files = (preview.files || [])
+    .map((file) => [file.path, file.deletable === true, file.exists === true, file.selectedByDefault === true])
+    .sort((left, right) => String(left[0]).localeCompare(String(right[0])))
+  const attachments = (preview.attachments || [])
+    .map((attachment) => [attachment.id, attachment.deletable === true])
+    .sort((left, right) => String(left[0]).localeCompare(String(right[0])))
+  const spills = (preview.spills || [])
+    .map((spill) => spill.directory)
+    .sort()
+  return JSON.stringify({ sessions, files, attachments, spills, options: preview.options })
+}
+
+function prunePreviewTokens() {
+  const now = Date.now()
+  for (const [token, record] of previewTokens) {
+    if (record.expiresAt <= now) previewTokens.delete(token)
+  }
+  while (previewTokens.size > MAX_PREVIEW_TOKENS) {
+    const oldest = previewTokens.keys().next().value
+    if (oldest === undefined) break
+    previewTokens.delete(oldest)
+  }
+}
+
+function rememberPreview(ids, options, preview) {
+  prunePreviewTokens()
+  const token = randomBytes(24).toString('base64url')
+  previewTokens.set(token, {
+    ids: [...new Set(ids)].sort(),
+    options,
+    fingerprint: previewFingerprint(preview),
+    expiresAt: Date.now() + PREVIEW_TOKEN_TTL_MS,
+  })
+  prunePreviewTokens()
+  return token
+}
+
+function getPreviewToken(token) {
+  if (typeof token !== 'string' || token.length === 0) return undefined
+  const record = previewTokens.get(token)
+  if (record === undefined) return undefined
+  if (record.expiresAt <= Date.now()) {
+    previewTokens.delete(token)
+    return undefined
+  }
+  return record
 }
 
 function sendJson(res, status, payload) {
@@ -1343,11 +1602,12 @@ async function readJsonBody(req) {
 function normaliseOptions(input) {
   const options = input !== null && typeof input === 'object' ? input : {}
   return {
-    attachments: options.attachments !== false,
-    workspaceFiles: options.workspaceFiles !== false,
-    scanCreated: options.scanCreated !== false,
-    spills: options.spills !== false,
-    conversationFolder: options.conversationFolder !== false,
+    attachments: options.attachments === true,
+    workspaceFiles: options.workspaceFiles === true,
+    scanCreated: options.scanCreated === true,
+    spills: options.spills === true,
+    conversationFolder: options.conversationFolder === true,
+    allowUnknownFolderEntries: options.allowUnknownFolderEntries === true,
     imageCache: options.imageCache === true,
   }
 }
@@ -1537,16 +1797,11 @@ async function listArchived(ctx) {
   }
 }
 
-async function removeConversationIndexEntry(indexPath, id, warnings) {
-  const index = await readJsonFile(indexPath, undefined)
-  if (index === null || typeof index !== 'object' || Array.isArray(index)) return false
-  if (!Object.prototype.hasOwnProperty.call(index, id)) return false
-  const next = { ...index }
-  delete next[id]
-  const temporary = `${indexPath}.${process.pid}.${Date.now()}.tmp`
+async function writeJsonAtomic(path, value) {
+  const temporary = `${path}.${process.pid}.${Date.now()}.${randomBytes(4).toString('hex')}.tmp`
   try {
-    await writeFile(temporary, `${JSON.stringify(next, null, 2)}\n`, 'utf8')
-    await rename(temporary, indexPath)
+    await writeFile(temporary, `${JSON.stringify(value, null, 2)}\n`, 'utf8')
+    await rename(temporary, path)
     return true
   } catch (error) {
     try {
@@ -1554,16 +1809,74 @@ async function removeConversationIndexEntry(indexPath, id, warnings) {
     } catch {
       /* no temporary file to clean */
     }
-    warnings.push(`Conversation index ${indexPath}: could not remove ${id} (${formatError(error)}).`)
-    return false
+    throw error
   }
 }
 
+async function removeConversationIndexEntry(indexPath, id, warnings) {
+  for (let attempt = 0; attempt < 3; attempt += 1) {
+    const index = await readJsonFile(indexPath, undefined)
+    if (index === null || typeof index !== 'object' || Array.isArray(index)) {
+      if (attempt === 0) {
+        warnings.push(`Conversation index ${indexPath}: it is missing or malformed; the folder was removed but its index entry could not be updated.`)
+      }
+      return false
+    }
+    if (!Object.prototype.hasOwnProperty.call(index, id)) return false
+    const next = { ...index }
+    delete next[id]
+    try {
+      await writeJsonAtomic(indexPath, next)
+    } catch (error) {
+      warnings.push(`Conversation index ${indexPath}: could not remove ${id} (${formatError(error)}).`)
+      return false
+    }
+    const after = await readJsonFile(indexPath, undefined)
+    if (after === null || typeof after !== 'object' || Array.isArray(after)) continue
+    if (!Object.prototype.hasOwnProperty.call(after, id)) {
+      const lost = Object.keys(index).filter((key) => key !== id && !Object.prototype.hasOwnProperty.call(after, key))
+      if (lost.length === 0) return true
+      const merged = { ...after }
+      for (const key of lost) merged[key] = index[key]
+      try {
+        await writeJsonAtomic(indexPath, merged)
+        return true
+      } catch (error) {
+        warnings.push(`Conversation index ${indexPath}: could not restore ${lost.length} concurrent entry/entries (${formatError(error)}).`)
+        return false
+      }
+    }
+  }
+  warnings.push(`Conversation index ${indexPath}: the entry for ${id} changed concurrently; refresh and retry.`)
+  return false
+}
+
 async function removeConversationFolder(entry, id, warnings) {
+  if (entry.deletable !== true) {
+    throw new Error(`refusing to delete a conversation folder that is not safe: ${entry.reason ?? 'unknown reason'}`)
+  }
+  if (entry.sharedWith !== undefined && entry.sharedWith.length > 0) {
+    throw new Error('refusing to delete a conversation folder still used by another Session')
+  }
   const folder = resolve(entry.path ?? entry.folder)
+  if (!(await isRealDirectory(folder))) {
+    throw new Error('refusing to delete a conversation folder that is not a real directory')
+  }
   const metadata = await readConversationMetadata(folder)
   if (!isConversationFolderFor(folder, metadata, id, entry.workspace)) {
     throw new Error('refusing to delete a folder whose session.json does not identify this Session')
+  }
+  if (await hasSymlinkAncestor(folder, entry.workspace)) {
+    throw new Error('refusing to delete a conversation folder reached through a symlink or junction')
+  }
+  const entries = await readdir(folder, { withFileTypes: true }).catch(() => [])
+  const names = entries.map((item) => item.name)
+  const splitLayout = names.includes('work') || names.includes('out')
+  if (splitLayout && entry.allowUnknown !== true) {
+    const unknown = names.filter((name) => !KNOWN_FOLDER_ENTRIES.has(name))
+    if (unknown.length > 0) {
+      throw new Error(`refusing to delete a conversation folder with unexpected entries: ${unknown.slice(0, 5).join(', ')}`)
+    }
   }
   const bytes = await sizeOfDirectory(folder)
   try {
@@ -1575,12 +1888,23 @@ async function removeConversationFolder(entry, id, warnings) {
   return { removed: true, bytes }
 }
 
-async function executeDeletion(ctx, body) {
+async function executeDeletion(ctx, body, tokenRecord) {
+  if (tokenRecord === undefined) {
+    throw new HttpError(409, 'preview-required', 'Preview the cleanup again before deleting.')
+  }
   if (body.confirmed !== true) {
     throw new HttpError(400, 'confirmation-required', 'Confirm the permanent deletion in the preview first.')
   }
   const options = normaliseOptions(body.options)
+  const requestedIds = Array.isArray(body.ids) ? [...new Set(body.ids)].sort() : []
+  if (JSON.stringify(requestedIds) !== JSON.stringify(tokenRecord.ids) ||
+      JSON.stringify(options) !== JSON.stringify(tokenRecord.options)) {
+    throw new HttpError(409, 'stale-preview', 'The Session selection or cleanup options changed. Preview again before deleting.')
+  }
   const preview = await buildPreview(ctx, body.ids, options)
+  if (previewFingerprint(preview) !== tokenRecord.fingerprint) {
+    throw new HttpError(409, 'stale-preview', 'The deletion candidates changed. Preview again before deleting.')
+  }
   for (const session of preview.sessions) {
     if (ctx.sessions.get(session.id) !== undefined) {
       throw new HttpError(409, 'session-live', `Session ${session.id} became live; close it before deleting.`)
@@ -1593,7 +1917,7 @@ async function executeDeletion(ctx, body) {
 
   const allowedFiles = new Map()
   for (const file of preview.files) {
-    if (file.protected === true || file.exists !== true) continue
+    if (file.deletable !== true) continue
     allowedFiles.set(pathKey(file.path), file)
   }
   for (const path of requestedFiles) {
@@ -1615,7 +1939,7 @@ async function executeDeletion(ctx, body) {
     sessions: { requested: selectedIds.size, removed: 0, missing: 0 },
     logs: { removed: 0, bytes: 0 },
     projection: { removed: 0, bytes: 0 },
-    conversation: { removed: 0, bytes: 0 },
+    conversation: { removed: 0, bytes: 0, skipped: 0 },
     attachments: { removed: 0, bytes: 0, skipped: 0 },
     files: { removed: 0, bytes: 0, skipped: 0 },
     spills: { removed: 0, bytes: 0, skipped: 0 },
@@ -1634,41 +1958,27 @@ async function executeDeletion(ctx, body) {
   for (const session of preview.sessions) {
     const id = session.id
     const workspace = workspaceBySession.get(id)
-    try {
-      if (workspace !== undefined) await workspace.detachSession(id)
-    } catch (error) {
-      report.errors.push({ scope: 'workspace', id, message: formatError(error) })
-    }
-    try {
-      await ctx.workspaceRegistry.unpinSession(id)
-    } catch (error) {
-      report.errors.push({ scope: 'unpin', id, message: formatError(error) })
-    }
-    try {
-      await ctx.workspaceRegistry.unarchiveSession(id)
-    } catch (error) {
-      report.errors.push({ scope: 'unarchive', id, message: formatError(error) })
+
+    if (ctx.sessions.get(id) !== undefined) {
+      failedSessions.add(id)
+      report.errors.push({ scope: 'session-live', id, message: 'The Session became live; its files and log were kept.' })
+      continue
     }
 
     if (options.conversationFolder === true && session.conversationFolder !== null) {
-      try {
-        const removal = await removeConversationFolder(session.conversationFolder, id, report.warnings)
-        report.conversation.removed += 1
-        report.conversation.bytes += removal.bytes
-      } catch (error) {
-        failedSessions.add(id)
-        report.errors.push({ scope: 'conversation-folder', id, message: formatError(error) })
+      if (session.conversationFolder.deletable !== true) {
+        report.conversation.skipped += 1
+        report.warnings.push(`Session ${id}: conversation folder kept because ${session.conversationFolder.reason ?? 'it is not safe to delete'}.`)
+      } else {
         try {
-          await ctx.workspaceRegistry.archiveSession(id, { stopActivity: true })
-        } catch (restoreError) {
-          report.errors.push({ scope: 'restore-archive', id, message: formatError(restoreError) })
+          const removal = await removeConversationFolder(session.conversationFolder, id, report.warnings)
+          report.conversation.removed += 1
+          report.conversation.bytes += removal.bytes
+        } catch (error) {
+          failedSessions.add(id)
+          report.errors.push({ scope: 'conversation-folder', id, message: formatError(error) })
+          continue
         }
-        try {
-          if (workspace !== undefined) await workspace.attachSession(id)
-        } catch {
-          /* the Session stays ungrouped rather than losing its folder */
-        }
-        continue
       }
     }
 
@@ -1678,41 +1988,72 @@ async function executeDeletion(ctx, body) {
       report.projection.bytes += projection.bytes
     }
 
+    let logRemoved = false
     if (session.missing === true) {
       report.sessions.missing += 1
-      report.sessions.removed += 1
-      continue
-    }
-
-    try {
-      const directory = await resolveSessionDirectory(persistenceRoot(ctx), {
-        cwd: session.cwd,
-      }, id)
-      if (directory === undefined) {
-        report.sessions.missing += 1
-        report.sessions.removed += 1
+      logRemoved = true
+    } else {
+      if (ctx.sessions.get(id) !== undefined) {
+        failedSessions.add(id)
+        report.errors.push({ scope: 'session-live', id, message: 'The Session became live before its log deletion; its log was kept.' })
         continue
       }
-      const removal = await removeSessionDirectory(persistenceRoot(ctx), directory, id)
-      if (removal.removed) {
-        report.logs.removed += 1
-        report.logs.bytes += removal.bytes
-        report.sessions.removed += 1
-      }
-    } catch (error) {
-      failedSessions.add(id)
-      report.errors.push({ scope: 'session-log', id, message: formatError(error) })
       try {
-        await ctx.workspaceRegistry.archiveSession(id, { stopActivity: true })
-      } catch (restoreError) {
-        report.errors.push({ scope: 'restore-archive', id, message: formatError(restoreError) })
-      }
-      try {
-        if (workspace !== undefined) await workspace.attachSession(id)
-      } catch {
-        /* the Session stays ungrouped rather than losing its log */
+        const directory = await resolveSessionDirectory(persistenceRoot(ctx), {
+          cwd: session.cwd,
+        }, id)
+        if (directory === undefined) {
+          report.sessions.missing += 1
+          logRemoved = true
+        } else {
+          const removal = await removeSessionDirectory(persistenceRoot(ctx), directory, id)
+          if (removal.removed) {
+            report.logs.removed += 1
+            report.logs.bytes += removal.bytes
+            logRemoved = true
+          } else {
+            report.sessions.missing += 1
+            logRemoved = true
+          }
+        }
+      } catch (error) {
+        failedSessions.add(id)
+        report.errors.push({ scope: 'session-log', id, message: formatError(error) })
+        continue
       }
     }
+
+    if (!logRemoved) continue
+    report.sessions.removed += 1
+
+    /* Registry state is changed only after the filesystem work succeeds. This
+       keeps a failed deletion archived at its original workspace position and
+       avoids exposing the Session to the UI while its log is being removed. */
+    let detached = workspace === undefined
+    if (workspace !== undefined) {
+      try {
+        await workspace.detachSession(id)
+        detached = true
+      } catch (error) {
+        report.errors.push({ scope: 'workspace', id, message: formatError(error) })
+      }
+    }
+    if (!detached) {
+      report.warnings.push(`Session ${id}: its files were removed, but it remains archived because detaching from its workspace failed.`)
+      continue
+    }
+    try {
+      await ctx.workspaceRegistry.unarchiveSession(id)
+    } catch (error) {
+      report.errors.push({ scope: 'unarchive', id, message: formatError(error) })
+      continue
+    }
+    try {
+      await ctx.workspaceRegistry.unpinSession(id)
+    } catch (error) {
+      report.errors.push({ scope: 'unpin', id, message: formatError(error) })
+    }
+    factCache.delete(id)
   }
 
   let protectedAttachments = null
@@ -1722,6 +2063,11 @@ async function executeDeletion(ctx, body) {
     protectedAttachments = new Set()
     protectedFiles = new Set()
     protectedSpills = new Set(failedSessions)
+    for (const file of preview.files) {
+      if (Array.isArray(file.sessionIds) && file.sessionIds.some((id) => failedSessions.has(id))) {
+        protectedFiles.add(pathKey(file.path))
+      }
+    }
     try {
       const snapshots = await ctx.sessionPersistence.list()
       const snapshotById = new Map(snapshots.map((snapshot) => [snapshot.header.id, snapshot]))
@@ -1822,6 +2168,7 @@ async function executeDeletion(ctx, body) {
       .catch(() => {})
   }
 
+  previewTokens.delete(body.previewToken)
   return report
 }
 
@@ -1863,14 +2210,17 @@ export function apply(ctx) {
       }
       if (op === 'preview') {
         const options = normaliseOptions(body.options)
+        const preview = await buildPreview(ctx, body.ids, options)
+        const previewToken = rememberPreview(body.ids, options, preview)
         sendJson(res, 200, {
           ok: true,
-          value: await buildPreview(ctx, body.ids, options),
+          value: { ...preview, previewToken },
         })
         return
       }
       if (op === 'delete') {
-        sendJson(res, 200, { ok: true, value: await executeDeletion(ctx, body) })
+        const tokenRecord = getPreviewToken(body.previewToken)
+        sendJson(res, 200, { ok: true, value: await executeDeletion(ctx, body, tokenRecord) })
         return
       }
       sendJson(res, 400, { ok: false, error: { code: 'unknown-op', message: 'Unknown operation.' } })

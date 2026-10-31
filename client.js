@@ -11,7 +11,7 @@ window.__ModuleLoader__.load({
   factory(require) {
     const React = require('react')
     const h = React.createElement
-    const { useCallback, useEffect, useMemo, useState } = React
+    const { useCallback, useEffect, useMemo, useRef, useState } = React
 
     const NS = 'session-cleaner'
     const ROUTE = '/dsh-session-cleaner/api'
@@ -38,12 +38,14 @@ window.__ModuleLoader__.load({
         messages: '{count} 条记录',
         workspace: '工作区',
         noWorkspace: '未归入工作区',
-        openWorkspace: '打开工作目录',
+        openWorkspace: '打开目录',
         openWorkspaceFailed: '无法打开目录：{message}',
-        noWorkspacePath: '该会话没有可打开的工作目录',
+        noWorkspacePath: '该会话没有可打开的目录',
         optionsTitle: '清理范围',
         optConversationFolder: '删除会话专用目录',
-        optConversationFolderHint: '删除 session-archive 为每个对话创建的 conversations/<时间_标题>/ 目录，包括 work、out、session.json 与 AGENTS.md 副本；同时移除 index.json 中的映射。',
+        optConversationFolderHint: '删除 session-archive 为每个对话创建的 conversations/<时间_标题>/ 目录，包括 work、out、session.json 与 AGENTS.md 副本；同时移除 index.json 中的映射。若目录仍被其他会话使用，或含有未知顶层文件，则默认保留。',
+        optFolderUnknown: '同时删除会话目录中的其他文件',
+        optFolderUnknownHint: '仅在目录含有 work/out/session.json/AGENTS.md 之外的文件时需要。默认关闭；关闭时整目录删除会被阻止，未知文件会列在预览中。',
         optAttachments: '删除仅被这些会话引用的附件',
         optAttachmentsHint: '删除前会扫描其余会话；仍被引用的附件会保留。只检查会话日志中的引用，未提交草稿或外部程序的引用无法检测。',
         optFiles: '删除这些会话在工作区产生的文件',
@@ -53,7 +55,7 @@ window.__ModuleLoader__.load({
         optSpills: '删除会话的工具输出临时文件',
         optSpillsHint: '清理 dsh-spill 根目录下以会话哈希命名的目录（过大的工具结果溢出文件）。',
         optImageCache: '同时清空附件请求缓存',
-        optImageCacheHint: '仅删除可重建的缩略图/请求图像缓存，不影响其他会话。',
+        optImageCacheHint: '删除全局可重建的缩略图/请求图像缓存。它会被所有会话共用，因此会影响其他会话的缓存命中，但不会删除持久附件。',
         preview: '预览清理',
         previewing: '正在扫描并核对引用…',
         previewFailed: '预览失败：{message}',
@@ -77,15 +79,21 @@ window.__ModuleLoader__.load({
         noProjection: '无检查点',
         readError: '日志读取失败：{message}',
         sharedWith: '仍被 {count} 个其他会话引用',
-        outsideWorkspace: '位于工作区之外',
+        outsideWorkspace: '位于工作区之外，已保留',
         protectedItem: '受保护，不会删除',
         missingFile: '文件已不存在',
         symlink: '符号链接，不会删除',
+        symlinkAncestor: '路径经过符号链接或 Junction，不会删除',
+        referencesUnknown: '引用状态未知，已保留',
+        sharedFolder: '所在会话目录仍被其他会话使用，已保留',
+        notDeletable: '安全校验未通过，不会删除',
+        folderUnknownEntries: '目录含 {count} 个未知顶层项',
         fileOrigin: '来源：{origins}',
         createdDuring: '会话期间新建',
-        modifiedDuring: '会话期间修改',
+        preExisting: '会话前已存在或创建时间未知',
         originWrite: '写入',
         originEdit: '编辑',
+        originReplace: '替换编辑',
         originPresent: '交付',
         originScan: '扫描',
         attachmentImage: '图片',
@@ -119,6 +127,8 @@ window.__ModuleLoader__.load({
         deleteFailed: '删除失败：{message}',
         resultTitle: '清理完成',
         resultSummary: '已处理 {sessions} 个会话，删除日志 {logs} 份、检查点 {projections} 份、会话目录 {folders} 个、附件 {attachments} 个、工作区文件 {files} 个、工具输出临时目录 {spills} 个，共释放 {bytes}。',
+        resultSkipped: '因共享引用、工作区边界或安全校验保留：附件 {attachments} 个、工作区文件 {files} 个、临时目录 {spills} 个。',
+        resultConversationSkipped: '有 {count} 个会话目录因仍被其他会话使用或含有未知文件而保留。',
         resultMissing: '其中 {count} 个会话的日志此前已缺失，只清理了归档记录。',
         resultImageCache: '附件请求缓存已清空（{bytes}）。',
         resultErrors: '未完成的项目',
@@ -126,6 +136,7 @@ window.__ModuleLoader__.load({
         closeResult: '返回列表',
         refreshHint: '若侧边栏仍显示已删除的会话，刷新页面即可。',
         requestFailed: '请求失败：{message}',
+        requestTimeout: '请求超时或已取消，请重试。',
         stalePreview: '预览已过期，已为你清除。请重新预览后再删除。',
         dangerBadge: '永久',
         archiveOnly: '仅归档记录',
@@ -150,12 +161,14 @@ window.__ModuleLoader__.load({
         messages: '{count} records',
         workspace: 'Workspace',
         noWorkspace: 'No workspace',
-        openWorkspace: 'Open working directory',
+        openWorkspace: 'Open folder',
         openWorkspaceFailed: 'Could not open the directory: {message}',
-        noWorkspacePath: 'This Session has no openable working directory.',
+        noWorkspacePath: 'This Session has no openable directory.',
         optionsTitle: 'Cleanup scope',
         optConversationFolder: 'Delete the per-Session conversation folder',
-        optConversationFolderHint: 'Removes the conversations/<timestamp_title>/ folder created by session-archive, including work, out, session.json, and the AGENTS.md copy; its index.json entry is removed too.',
+        optConversationFolderHint: 'Removes the conversations/<timestamp_title>/ folder created by session-archive, including work, out, session.json, and the AGENTS.md copy; its index.json entry is removed too. The folder is kept when another Session still uses it or it contains unexpected top-level entries.',
+        optFolderUnknown: 'Also delete unexpected files in the conversation folder',
+        optFolderUnknownHint: 'Only needed when the folder contains entries other than work/out/session.json/AGENTS.md. Off by default; while off, whole-folder deletion is blocked and the entries are listed in the preview.',
         optAttachments: 'Delete attachments referenced only by these Sessions',
         optAttachmentsHint: 'The remaining Sessions are scanned first; an attachment still referenced elsewhere is kept. Only Session-log references are checked; drafts and external programs are not visible.',
         optFiles: 'Delete files these Sessions produced in the workspace',
@@ -165,7 +178,7 @@ window.__ModuleLoader__.load({
         optSpills: 'Delete the Session’s spilled tool-output files',
         optSpillsHint: 'Clears the session-hash directories under dsh-spill roots that hold oversized tool results.',
         optImageCache: 'Also clear the attachment request cache',
-        optImageCacheHint: 'Removes rebuildable thumbnail/request images for every Session.',
+        optImageCacheHint: 'Removes the global rebuildable thumbnail/request-image cache. Every Session shares it, so this affects other Sessions’ cache hits but never removes durable attachments.',
         preview: 'Preview cleanup',
         previewing: 'Scanning and checking references…',
         previewFailed: 'Preview failed: {message}',
@@ -189,15 +202,21 @@ window.__ModuleLoader__.load({
         noProjection: 'No checkpoint',
         readError: 'Log read failed: {message}',
         sharedWith: 'Still referenced by {count} other Session(s)',
-        outsideWorkspace: 'Outside the workspace',
+        outsideWorkspace: 'Outside the workspace; kept',
         protectedItem: 'Protected; will not be deleted',
         missingFile: 'File no longer exists',
         symlink: 'Symbolic link; will not be deleted',
+        symlinkAncestor: 'Path crosses a symlink or junction; will not be deleted',
+        referencesUnknown: 'Reference state unknown; kept',
+        sharedFolder: 'Containing conversation folder is still in use; kept',
+        notDeletable: 'Failed the safety check; will not be deleted',
+        folderUnknownEntries: 'Folder has {count} unexpected top-level entries',
         fileOrigin: 'Origin: {origins}',
         createdDuring: 'Created during the Session',
-        modifiedDuring: 'Modified during the Session',
+        preExisting: 'Existed before the Session or creation time unknown',
         originWrite: 'write',
         originEdit: 'edit',
+        originReplace: 'replace-edit',
         originPresent: 'present',
         originScan: 'scan',
         attachmentImage: 'Image',
@@ -231,6 +250,8 @@ window.__ModuleLoader__.load({
         deleteFailed: 'Deletion failed: {message}',
         resultTitle: 'Cleanup complete',
         resultSummary: 'Processed {sessions} Session(s), removed {logs} log(s), {projections} checkpoint(s), {folders} conversation folder(s), {attachments} attachment(s), {files} workspace file(s), and {spills} spill director(ies), freeing {bytes}.',
+        resultSkipped: 'Kept by sharing, workspace-boundary, or safety checks: {attachments} attachment(s), {files} workspace file(s), {spills} spill director(ies).',
+        resultConversationSkipped: '{count} conversation folder(s) were kept because another Session still uses them or they contain unexpected files.',
         resultMissing: '{count} Session log(s) were already missing; only archive records were cleaned.',
         resultImageCache: 'The attachment request cache was cleared ({bytes}).',
         resultErrors: 'Items not completed',
@@ -238,6 +259,7 @@ window.__ModuleLoader__.load({
         closeResult: 'Back to the list',
         refreshHint: 'If the sidebar still shows a deleted Session, reload the page.',
         requestFailed: 'Request failed: {message}',
+        requestTimeout: 'The request timed out or was cancelled. Try again.',
         stalePreview: 'The preview expired and was cleared. Preview again before deleting.',
         dangerBadge: 'Permanent',
         archiveOnly: 'Archive only',
@@ -401,13 +423,22 @@ window.__ModuleLoader__.load({
       empty: { color: 'var(--dsw-alias-label-secondary)', padding: '6px 0' },
     }
 
-    async function callApi(op, payload) {
+    async function callApi(op, payload, options = {}) {
+      const timeoutMs = Number.isFinite(options.timeoutMs) ? options.timeoutMs : 600000
+      const timeoutSignal = typeof AbortSignal !== 'undefined' && typeof AbortSignal.timeout === 'function'
+        ? AbortSignal.timeout(timeoutMs)
+        : undefined
+      let signal = options.signal ?? timeoutSignal
+      if (options.signal !== undefined && timeoutSignal !== undefined && typeof AbortSignal.any === 'function') {
+        signal = AbortSignal.any([options.signal, timeoutSignal])
+      }
       const response = await fetch(ROUTE, {
         method: 'POST',
         credentials: 'same-origin',
         headers: {
           'content-type': 'application/json',
         },
+        signal,
         body: JSON.stringify({ op, ...payload }),
       })
       let data
@@ -557,10 +588,30 @@ window.__ModuleLoader__.load({
 
       function FileRow(props) {
         const file = props.file
-        const disabled = file.protected === true || file.exists !== true
+        const deletable = file.deletable !== undefined
+          ? file.deletable === true
+          : file.protected !== true &&
+            file.exists === true &&
+            file.outsideWorkspace !== true &&
+            file.referencesUnknown !== true &&
+            !(file.sharedWith && file.sharedWith.length > 0)
+        const disabled = !deletable
         const origins = (file.origins || [])
-          .map((origin) => t(origin === 'write' ? 'originWrite' : origin === 'edit' ? 'originEdit' : origin === 'present' ? 'originPresent' : 'originScan'))
+          .map((origin) => t(origin === 'write' ? 'originWrite' : origin === 'edit' ? 'originEdit' : origin === 'str_replace_editor' ? 'originReplace' : origin === 'present' ? 'originPresent' : 'originScan'))
           .join(' / ')
+        const reasonText = file.reasonCode === 'missing'
+          ? t('missingFile')
+          : file.reasonCode === 'symlink'
+            ? t('symlink')
+            : file.reasonCode === 'symlink-ancestor'
+              ? t('symlinkAncestor')
+              : file.reasonCode === 'references-unknown'
+                ? t('referencesUnknown')
+                : file.reasonCode === 'shared-folder'
+                  ? t('sharedFolder')
+                  : file.reasonCode === 'outside-workspace'
+                    ? t('outsideWorkspace')
+                    : t('notDeletable')
         return h(
           'div',
           { style: { ...STYLE.row, ...(props.last ? STYLE.rowLast : {}) } },
@@ -580,14 +631,14 @@ window.__ModuleLoader__.load({
               [
                 formatBytes(file.sizeBytes),
                 t('fileOrigin', { origins }),
-                file.createdDuring ? t('createdDuring') : t('modifiedDuring'),
+                file.createdDuring ? t('createdDuring') : t('preExisting'),
               ].join(' · '),
               file.outsideWorkspace ? previewBadge(t('outsideWorkspace'), STYLE.badgeWarn) : null,
               file.sharedWith && file.sharedWith.length > 0
                 ? previewBadge(t('sharedWith', { count: file.sharedWith.length }), STYLE.badgeWarn)
                 : null,
-              file.protected === true
-                ? previewBadge(file.reason === 'missing' ? t('missingFile') : file.reason === 'symlink' ? t('symlink') : t('protectedItem'), STYLE.badgeDanger)
+              disabled && file.reasonCode !== 'outside-workspace' && file.reasonCode !== 'shared'
+                ? previewBadge(reasonText, STYLE.badgeDanger)
                 : null,
             ),
           ),
@@ -641,6 +692,7 @@ window.__ModuleLoader__.load({
         const [selected, setSelected] = useState(() => new Set())
         const [options, setOptions] = useState({
           conversationFolder: true,
+          allowUnknownFolderEntries: false,
           attachments: true,
           workspaceFiles: true,
           scanCreated: true,
@@ -648,6 +700,7 @@ window.__ModuleLoader__.load({
           imageCache: false,
         })
         const [preview, setPreview] = useState(null)
+        const [previewToken, setPreviewToken] = useState(null)
         const [previewing, setPreviewing] = useState(false)
         const [previewError, setPreviewError] = useState(null)
         const [fileChoice, setFileChoice] = useState(() => new Map())
@@ -659,10 +712,26 @@ window.__ModuleLoader__.load({
         const [report, setReport] = useState(null)
         const [openingId, setOpeningId] = useState(null)
         const [openError, setOpenError] = useState(null)
+        const requestSeq = useRef(0)
+        const loadAbort = useRef(null)
+        const previewAbort = useRef(null)
+
+        const messageOf = (error) => {
+          if (error && (error.name === 'AbortError' || error.name === 'TimeoutError')) return t('requestTimeout')
+          return error instanceof Error ? error.message : String(error)
+        }
 
         const load = useCallback(async () => {
+          const seq = ++requestSeq.current
+          previewAbort.current?.abort()
+          previewAbort.current = null
+          loadAbort.current?.abort()
+          const controller = new AbortController()
+          loadAbort.current = controller
           setPhase('loading')
           setPreview(null)
+          setPreviewToken(null)
+          setPreviewing(false)
           setPreviewError(null)
           setFileChoice(new Map())
           setAttachmentChoice(new Map())
@@ -670,83 +739,94 @@ window.__ModuleLoader__.load({
           setDeleteError(null)
           setOpenError(null)
           try {
-            const value = await callApi('list', {})
-            setSessions(Array.isArray(value.sessions) ? value.sessions : [])
+            const value = await callApi('list', {}, { signal: controller.signal, timeoutMs: 60000 })
+            if (seq !== requestSeq.current) return
+            const list = Array.isArray(value.sessions) ? value.sessions : []
+            setSessions(list)
             setSelected((previous) => {
               const next = new Set()
               for (const id of previous) {
-                if (value.sessions.some((session) => session.id === id && session.live !== true)) next.add(id)
+                if (list.some((session) => session.id === id && session.live !== true)) next.add(id)
               }
               return next
             })
             setPhase('ready')
           } catch (error) {
+            if (seq !== requestSeq.current) return
             setPhase('error')
-            setPreviewError(error instanceof Error ? error.message : String(error))
+            setPreviewError(error && (error.name === 'AbortError' || error.name === 'TimeoutError')
+              ? t('requestTimeout')
+              : (error instanceof Error ? error.message : String(error)))
+          } finally {
+            if (loadAbort.current === controller) loadAbort.current = null
           }
         }, [])
 
         useEffect(() => {
           load()
+          return () => {
+            loadAbort.current?.abort()
+            previewAbort.current?.abort()
+          }
         }, [load])
 
         const openWorkspace = async (session) => {
           setOpeningId(session.id)
           setOpenError(null)
           const paths = []
-          let resolvedPath
           if (typeof session.conversationFolder === 'string' && session.conversationFolder.length > 0) {
-            resolvedPath = session.conversationFolder
-            paths.push(resolvedPath)
+            paths.push(session.conversationFolder)
           }
           try {
-            const resolved = await callApi('project-path', { sessionId: session.id })
+            const resolved = await callApi('project-path', { sessionId: session.id }, { timeoutMs: 60000 })
             if (resolved && typeof resolved.path === 'string' && resolved.path.length > 0) {
-              if (resolvedPath === undefined) resolvedPath = resolved.path
               paths.push(resolved.path)
             }
           } catch {
             /* an older Host or a transient read failure falls back to stored paths */
           }
-          if (resolvedPath === undefined) {
-            if (typeof session.cwd === 'string' && session.cwd.length > 0) paths.push(session.cwd)
-            if (session.workspace && typeof session.workspace.path === 'string' && session.workspace.path.length > 0) {
-              paths.push(session.workspace.path)
-            }
+          if (typeof session.cwd === 'string' && session.cwd.length > 0) paths.push(session.cwd)
+          if (session.workspace && typeof session.workspace.path === 'string' && session.workspace.path.length > 0) {
+            paths.push(session.workspace.path)
           }
           if (paths.length === 0) {
             setOpeningId(null)
             setOpenError({ id: session.id, message: t('noWorkspacePath') })
             return
           }
-          let lastMessage = 'open failed'
+          let lastMessage = t('openWorkspaceFailed', { message: 'open failed' })
           try {
-            for (const path of [...new Set(paths)]) {
-              try {
-                const sessionRemote = ctx.remote && ctx.remote.session
-                if (sessionRemote === undefined || typeof sessionRemote.openWorkspacePath !== 'function') {
-                  lastMessage = 'the session Remote is unavailable'
-                  continue
+            const sessionRemote = ctx.remote && ctx.remote.session
+            if (sessionRemote === undefined || typeof sessionRemote.openWorkspacePath !== 'function') {
+              lastMessage = t('openWorkspaceFailed', { message: 'the session Remote is unavailable' })
+            } else {
+              for (const path of [...new Set(paths)]) {
+                try {
+                  const result = await sessionRemote.openWorkspacePath({ path }, new AbortController().signal)
+                  if (result && result.ok === false) {
+                    lastMessage = result.error && result.error.message ? result.error.message : lastMessage
+                    continue
+                  }
+                  if ((result && result.ok === true) || (result && result.opened === true)) return
+                  lastMessage = t('openWorkspaceFailed', { message: 'open failed' })
+                } catch (error) {
+                  lastMessage = error instanceof Error ? error.message : String(error)
                 }
-                const result = await sessionRemote.openWorkspacePath({ path }, new AbortController().signal)
-                if (result && result.ok === false) {
-                  lastMessage = result.error && result.error.message ? result.error.message : lastMessage
-                  continue
-                }
-                if ((result && result.ok === true) || (result && result.opened === true)) return
-                lastMessage = 'open failed'
-              } catch (error) {
-                lastMessage = error instanceof Error ? error.message : String(error)
               }
             }
-            setOpenError({ id: session.id, message: t('openWorkspaceFailed', { message: lastMessage }) })
+            setOpenError({ id: session.id, message: lastMessage })
           } finally {
             setOpeningId(null)
           }
         }
 
         const invalidatePreview = () => {
+          requestSeq.current += 1
+          previewAbort.current?.abort()
+          previewAbort.current = null
           setPreview(null)
+          setPreviewToken(null)
+          setPreviewing(false)
           setPreviewError(null)
           setConfirming(false)
           setDeleteError(null)
@@ -779,59 +859,74 @@ window.__ModuleLoader__.load({
 
         const previewNow = async () => {
           if (selected.size === 0) return
+          const seq = ++requestSeq.current
+          previewAbort.current?.abort()
+          const controller = new AbortController()
+          previewAbort.current = controller
           setPreviewing(true)
           setPreviewError(null)
           setDeleteError(null)
           setReport(null)
           setConfirming(false)
           try {
-            const value = await callApi('preview', { ids: [...selected], options })
+            const value = await callApi('preview', { ids: [...selected], options }, {
+              signal: controller.signal,
+              timeoutMs: 600000,
+            })
+            if (seq !== requestSeq.current) return
+            if (typeof value.previewToken !== 'string') {
+              setPreview(null)
+              setPreviewToken(null)
+              setPreviewError(t('stalePreview'))
+              return
+            }
             setPreview(value)
-            setFileChoice(new Map((value.files || []).map((file) => [file.path, file.selectedByDefault === true && file.protected !== true && file.exists === true])))
+            setPreviewToken(value.previewToken)
+            setFileChoice(new Map((value.files || []).map((file) => [file.path, file.deletable === true && file.selectedByDefault === true])))
             setAttachmentChoice(new Map((value.attachments || []).map((attachment) => [attachment.id, attachment.deletable === true])))
             setShowAllFiles(false)
           } catch (error) {
+            if (seq !== requestSeq.current) return
             setPreview(null)
-            setPreviewError(error instanceof Error ? error.message : String(error))
+            setPreviewToken(null)
+            setPreviewError(messageOf(error))
           } finally {
-            setPreviewing(false)
+            if (seq === requestSeq.current) setPreviewing(false)
+            if (previewAbort.current === controller) previewAbort.current = null
           }
         }
 
         const requestDelete = () => {
-          if (preview === null || selected.size === 0 || deleting) return
+          if (preview === null || previewToken === null || selected.size === 0 || deleting) return
           setConfirming(true)
           setDeleteError(null)
         }
 
         const deleteNow = async () => {
-          if (preview === null || confirming !== true || deleting) return
+          if (preview === null || previewToken === null || confirming !== true || deleting) return
           setDeleting(true)
           setDeleteError(null)
           try {
             const value = await callApi('delete', {
               ids: [...selected],
               options,
+              previewToken,
               confirmed: true,
               files: [...fileChoice.entries()].filter(([, checked]) => checked).map(([path]) => path),
               attachments: [...attachmentChoice.entries()].filter(([, checked]) => checked).map(([id]) => id),
-            })
+            }, { timeoutMs: 900000 })
             setReport(value)
             setPreview(null)
+            setPreviewToken(null)
             setSelected(new Set())
             setConfirming(false)
             setDeleteError(null)
-            try {
-              const clientSessions = ctx.get('sessions')
-              if (clientSessions && typeof clientSessions.refresh === 'function') await clientSessions.refresh()
-            } catch {
-              /* the list below still refreshes from the Host */
-            }
             await load()
           } catch (error) {
-            const message = error instanceof Error ? error.message : String(error)
-            if (error && error.code === 'stale-preview') {
+            const message = messageOf(error)
+            if (error && (error.code === 'stale-preview' || error.code === 'preview-required')) {
               setPreview(null)
+              setPreviewToken(null)
               setConfirming(false)
               setPreviewError(t('stalePreview'))
             }
@@ -855,7 +950,7 @@ window.__ModuleLoader__.load({
           : showAllFiles
             ? preview.files || []
             : (preview.files || []).slice(0, FILE_PAGE)
-        const canDelete = preview !== null && selected.size > 0 && !deleting
+        const canDelete = preview !== null && previewToken !== null && selected.size > 0 && !deleting
 
         return h(
           'div',
@@ -926,6 +1021,13 @@ window.__ModuleLoader__.load({
                 onChange: (value) => setOption('conversationFolder', value),
                 title: t('optConversationFolder'),
                 hint: t('optConversationFolderHint'),
+              }),
+              h(OptionRow, {
+                checked: options.allowUnknownFolderEntries,
+                disabled: !options.conversationFolder,
+                onChange: (value) => setOption('allowUnknownFolderEntries', value),
+                title: t('optFolderUnknown'),
+                hint: t('optFolderUnknownHint'),
               }),
               h(OptionRow, {
                 checked: options.attachments,
@@ -1029,6 +1131,21 @@ window.__ModuleLoader__.load({
                     session.conversationFolder && (session.conversationFolder.entries || []).length > 0
                       ? h('div', { style: STYLE.mono }, session.conversationFolder.entries.join(' · '))
                       : null,
+                    session.conversationFolder && session.conversationFolder.sharedWith && session.conversationFolder.sharedWith.length > 0
+                      ? previewBadge(t('sharedWith', { count: session.conversationFolder.sharedWith.length }), STYLE.badgeWarn)
+                      : null,
+                    session.conversationFolder && session.conversationFolder.referencesUnknown
+                      ? previewBadge(t('referencesUnknown'), STYLE.badgeWarn)
+                      : null,
+                    session.conversationFolder && session.conversationFolder.unknownCount > 0
+                      ? previewBadge(t('folderUnknownEntries', { count: session.conversationFolder.unknownCount }), STYLE.badgeWarn)
+                      : null,
+                    session.conversationFolder && session.conversationFolder.reason
+                      ? h('div', { style: STYLE.warn }, session.conversationFolder.reason)
+                      : null,
+                    session.conversationFolder && (session.conversationFolder.unknownEntries || []).length > 0
+                      ? h('div', { style: STYLE.mono }, session.conversationFolder.unknownEntries.join(' · '))
+                      : null,
                     session.readError ? h('div', { style: STYLE.warn }, t('readError', { message: session.readError })) : null,
                   ),
                 ),
@@ -1073,11 +1190,7 @@ window.__ModuleLoader__.load({
                       type: 'button',
                       style: STYLE.button,
                       onClick: () => setFileChoice(new Map((preview.files || [])
-                        .filter((f) => f.protected !== true &&
-                          f.exists === true &&
-                          f.createdDuring === true &&
-                          f.outsideWorkspace !== true &&
-                          !(f.sharedWith && f.sharedWith.length > 0))
+                        .filter((f) => f.deletable === true && f.createdDuring === true)
                         .map((f) => [f.path, true]))),
                     }, t('selectAllFiles')),
                     h('button', {
@@ -1162,6 +1275,7 @@ window.__ModuleLoader__.load({
                             'button',
                             {
                               type: 'button',
+                              autoFocus: true,
                               style: { ...STYLE.button, ...(deleting ? STYLE.disabled : {}) },
                               disabled: deleting,
                               onClick: cancelDelete,
@@ -1208,6 +1322,17 @@ window.__ModuleLoader__.load({
                     bytes: formatBytes(report.logs.bytes + report.projection.bytes + (report.conversation ? report.conversation.bytes : 0) + report.attachments.bytes + report.files.bytes + (report.spills ? report.spills.bytes : 0)),
                   })),
                   report.sessions.missing > 0 ? h('p', { style: STYLE.meta }, t('resultMissing', { count: report.sessions.missing })) : null,
+                  (() => {
+                    const skippedAttachments = report.attachments?.skipped || 0
+                    const skippedFiles = report.files?.skipped || 0
+                    const skippedSpills = report.spills?.skipped || 0
+                    return skippedAttachments + skippedFiles + skippedSpills > 0
+                      ? h('p', { style: STYLE.meta }, t('resultSkipped', { attachments: skippedAttachments, files: skippedFiles, spills: skippedSpills }))
+                      : null
+                  })(),
+                  report.conversation && report.conversation.skipped > 0
+                    ? h('p', { style: STYLE.meta }, t('resultConversationSkipped', { count: report.conversation.skipped }))
+                    : null,
                   report.imageCache && report.imageCache.removed ? h('p', { style: STYLE.meta }, t('resultImageCache', { bytes: formatBytes(report.imageCache.bytes) })) : null,
                   (report.errors || []).length > 0
                     ? h('div', null,

@@ -921,6 +921,12 @@ window.__ModuleLoader__.load({
             setSelected(new Set())
             setConfirming(false)
             setDeleteError(null)
+            try {
+              const clientSessions = ctx.get('sessions')
+              if (clientSessions && typeof clientSessions.refresh === 'function') await clientSessions.refresh()
+            } catch {
+              /* the list below still refreshes from the Host */
+            }
             await load()
           } catch (error) {
             const message = messageOf(error)
@@ -1391,7 +1397,7 @@ window.__ModuleLoader__.load({
     }
 
     return {
-      inject: ['slots', 'locale', 'remote', 'remote.session'],
+      inject: ['slots', 'locale', 'remote', 'remote.session', 'sessions'],
       apply,
     }
   },

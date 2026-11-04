@@ -80,6 +80,11 @@ async function makeHarness(options = {}) {
       async archiveSession(sessionId) { archived.add(sessionId) },
     },
     sessions: { get(sessionId) { return liveById.get(sessionId) } },
+    agents: {
+      get(sessionId) {
+        return options.agentStatus === undefined ? undefined : { id: sessionId, status: options.agentStatus }
+      },
+    },
     storageDomain: {
       get() {
         return options.storageTable === undefined ? undefined : { table() { return options.storageTable } }
@@ -151,6 +156,47 @@ test('session cleaner safety regressions', async (t) => {
       })
       assert.equal(reused.ok, false)
       assert.equal(reused.error.code, 'preview-required')
+    } finally {
+      await harness.cleanup()
+    }
+  })
+
+  await t.test('idle open Sessions are not reported as running', async () => {
+    const id = nextId()
+    const harness = await makeHarness({
+      id,
+      agentStatus: 'idle',
+      live: [[id, { snapshotEvents() { return [] } }]],
+    })
+    try {
+      const list = await harness.call('list', {})
+      assert.equal(list.ok, true)
+      assert.equal(list.value.sessions[0].live, false)
+      assert.equal(list.value.sessions[0].open, true)
+      const options = { attachments: false, workspaceFiles: false, scanCreated: false, spills: false, conversationFolder: false, imageCache: false }
+      const preview = await harness.call('preview', { ids: [id], options })
+      assert.equal(preview.ok, true)
+      assert.equal(preview.value.sessions[0].live, false)
+      assert.match(preview.value.warnings.join('\n'), /open in this Host but idle/)
+    } finally {
+      await harness.cleanup()
+    }
+  })
+
+  await t.test('a running Agent still blocks preview and deletion', async () => {
+    const id = nextId()
+    const harness = await makeHarness({
+      id,
+      agentStatus: 'running',
+      live: [[id, { snapshotEvents() { return [] } }]],
+    })
+    try {
+      const list = await harness.call('list', {})
+      assert.equal(list.value.sessions[0].live, true)
+      const options = { attachments: false, workspaceFiles: false, scanCreated: false, spills: false, conversationFolder: false, imageCache: false }
+      const preview = await harness.call('preview', { ids: [id], options })
+      assert.equal(preview.ok, false)
+      assert.equal(preview.error.code, 'session-live')
     } finally {
       await harness.cleanup()
     }

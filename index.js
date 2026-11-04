@@ -39,6 +39,7 @@ export const inject = [
   'sessionQuery',
   'workspaceRegistry',
   'sessions',
+  'agents',
   'storageDomain',
 ]
 
@@ -154,6 +155,23 @@ function samePath(left, right) {
 function pathKey(path) {
   const normal = resolve(path)
   return process.platform === 'win32' ? normal.toLowerCase() : normal
+}
+
+/**
+ * A Session object in `ctx.sessions` only means the Session is loaded in this
+ * Host process. Archiving can leave an idle Agent (and its Session) published;
+ * only the Agent's `status` distinguishes that idle state from actual work.
+ */
+function agentStatusFor(ctx, id) {
+  try {
+    return ctx.agents.get(id)?.status
+  } catch {
+    return undefined
+  }
+}
+
+function isAgentRunning(ctx, id) {
+  return agentStatusFor(ctx, id) === 'running'
 }
 
 /**
@@ -744,8 +762,8 @@ async function buildPreview(ctx, ids, options) {
     if (!archived.has(id)) {
       throw new HttpError(409, 'not-archived', `Session ${id} is not archived; refresh the list and try again.`)
     }
-    if (ctx.sessions.get(id) !== undefined) {
-      throw new HttpError(409, 'session-live', `Session ${id} is open in this Host process; close it before deleting.`)
+    if (isAgentRunning(ctx, id)) {
+      throw new HttpError(409, 'session-live', `Session ${id} is still running; stop it before deleting.`)
     }
   }
 
@@ -785,12 +803,15 @@ async function buildPreview(ctx, ids, options) {
   for (const id of unique) {
     const snapshot = snapshotById.get(id)
     const workspace = workspaceBySession.get(id)
+    const sessionOpen = ctx.sessions.get(id) !== undefined
+    const running = isAgentRunning(ctx, id)
     const base = {
       id,
       title: titles.get(id) ?? undefined,
       cwd: snapshot?.header.cwd,
       createdAt: snapshot?.header.createdAt ?? 0,
-      live: false,
+      live: running,
+      open: sessionOpen,
       missing: snapshot === undefined,
       workspace: workspace === undefined ? null : { title: workspace.title, path: workspace.path },
       conversationFolder: null,
@@ -800,6 +821,9 @@ async function buildPreview(ctx, ids, options) {
       projectionCache: { path: projectionCachePath(id), exists: false, bytes: 0 },
       readError: undefined,
       lastEventTime: snapshot?.header.createdAt ?? 0,
+    }
+    if (sessionOpen && running !== true) {
+      warnings.push(`Session ${id}: it is open in this Host but idle. Its log may still be locked; close it if deletion fails.`)
     }
     if (snapshot === undefined) {
       sessions.push(base)
@@ -1781,7 +1805,8 @@ async function listArchived(ctx) {
       createdAt: snapshot?.header.createdAt ?? 0,
       sizeBytes: snapshot?.sizeBytes ?? 0,
       eventCount: snapshot?.eventCount ?? 0,
-      live: ctx.sessions.get(id) !== undefined,
+      live: isAgentRunning(ctx, id),
+      open: ctx.sessions.get(id) !== undefined,
       missing: snapshot === undefined,
       workspace: workspace === undefined ? null : { title: workspace.title, path: workspace.path },
       conversationFolder: conversationFolders.get(id)?.folder ?? null,
@@ -1906,8 +1931,8 @@ async function executeDeletion(ctx, body, tokenRecord) {
     throw new HttpError(409, 'stale-preview', 'The deletion candidates changed. Preview again before deleting.')
   }
   for (const session of preview.sessions) {
-    if (ctx.sessions.get(session.id) !== undefined) {
-      throw new HttpError(409, 'session-live', `Session ${session.id} became live; close it before deleting.`)
+    if (isAgentRunning(ctx, session.id)) {
+      throw new HttpError(409, 'session-live', `Session ${session.id} is still running; stop it before deleting.`)
     }
   }
   const selectedIds = new Set(preview.sessions.map((session) => session.id))
@@ -1959,9 +1984,9 @@ async function executeDeletion(ctx, body, tokenRecord) {
     const id = session.id
     const workspace = workspaceBySession.get(id)
 
-    if (ctx.sessions.get(id) !== undefined) {
+    if (isAgentRunning(ctx, id)) {
       failedSessions.add(id)
-      report.errors.push({ scope: 'session-live', id, message: 'The Session became live; its files and log were kept.' })
+      report.errors.push({ scope: 'session-live', id, message: 'The Session started running; its files and log were kept.' })
       continue
     }
 
@@ -1993,9 +2018,9 @@ async function executeDeletion(ctx, body, tokenRecord) {
       report.sessions.missing += 1
       logRemoved = true
     } else {
-      if (ctx.sessions.get(id) !== undefined) {
+      if (isAgentRunning(ctx, id)) {
         failedSessions.add(id)
-        report.errors.push({ scope: 'session-live', id, message: 'The Session became live before its log deletion; its log was kept.' })
+        report.errors.push({ scope: 'session-live', id, message: 'The Session started running before its log deletion; its log was kept.' })
         continue
       }
       try {

@@ -161,7 +161,7 @@ test('session cleaner safety regressions', async (t) => {
     }
   })
 
-  await t.test('idle open Sessions are not reported as running', async () => {
+  await t.test('idle open Sessions are blocked until restart', async () => {
     const id = nextId()
     const harness = await makeHarness({
       id,
@@ -175,9 +175,8 @@ test('session cleaner safety regressions', async (t) => {
       assert.equal(list.value.sessions[0].open, true)
       const options = { attachments: false, workspaceFiles: false, scanCreated: false, spills: false, conversationFolder: false, imageCache: false }
       const preview = await harness.call('preview', { ids: [id], options })
-      assert.equal(preview.ok, true)
-      assert.equal(preview.value.sessions[0].live, false)
-      assert.match(preview.value.warnings.join('\n'), /open in this Host but idle/)
+      assert.equal(preview.ok, false)
+      assert.equal(preview.error.code, 'session-open')
     } finally {
       await harness.cleanup()
     }

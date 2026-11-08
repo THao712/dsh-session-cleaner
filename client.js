@@ -23,6 +23,7 @@ window.__ModuleLoader__.load({
         title: '会话清理',
         intro: '选择已归档的会话，先预览将被永久删除的全部内容，再确认执行。删除范围包括会话日志、投影检查点、仅被这些会话引用的附件，以及会话在工作区中产生的文件。',
         dangerNote: '永久删除不可撤销。预览会逐项列出将被删除的路径；请确认其中没有你仍需保留的文件。',
+        openNote: '显示“已打开（需重启）”的会话仍被 Harness 加载。请先重启 Harness（归档状态会保留），再回来清理；否则删除后它会以“未分组”残留。',
         loading: '正在读取已归档会话…',
         loadFailed: '无法读取已归档会话：{message}',
         retry: '重试',
@@ -33,7 +34,7 @@ window.__ModuleLoader__.load({
         selected: '已选 {count} 个会话',
         totalSize: '列表合计 {size}',
         live: '运行中',
-        opened: '已打开',
+        opened: '已打开（需重启）',
         missing: '日志缺失',
         untitled: '未命名会话',
         messages: '{count} 条记录',
@@ -147,6 +148,7 @@ window.__ModuleLoader__.load({
         title: 'Session cleanup',
         intro: 'Pick archived Sessions, preview everything a permanent deletion would remove, then confirm. Deletion covers Session logs, projection checkpoints, attachments referenced only by these Sessions, and files the Sessions produced in their workspace.',
         dangerNote: 'Permanent deletion cannot be undone. The preview lists every path; check that nothing you still need is included.',
+        openNote: 'Sessions marked “Open (restart)” are still loaded by Harness. Restart Harness first (archive state is kept), then clean them up; otherwise they linger under Ungrouped.',
         loading: 'Reading archived Sessions…',
         loadFailed: 'Could not read archived Sessions: {message}',
         retry: 'Retry',
@@ -157,7 +159,7 @@ window.__ModuleLoader__.load({
         selected: '{count} Sessions selected',
         totalSize: '{size} in the list',
         live: 'Live',
-        opened: 'Open',
+        opened: 'Open (restart)',
         missing: 'Log missing',
         untitled: 'Untitled Session',
         messages: '{count} records',
@@ -559,7 +561,7 @@ window.__ModuleLoader__.load({
           { style: { ...STYLE.row, ...(props.last ? STYLE.rowLast : {}) } },
           h(Check, {
             checked: props.checked,
-            disabled: session.live === true,
+            disabled: session.live === true || session.open === true,
             onChange: () => props.onToggle(session.id),
             label: session.title || session.id,
           }),
@@ -749,7 +751,7 @@ window.__ModuleLoader__.load({
             setSelected((previous) => {
               const next = new Set()
               for (const id of previous) {
-                if (list.some((session) => session.id === id && session.live !== true)) next.add(id)
+                if (list.some((session) => session.id === id && session.live !== true && session.open !== true)) next.add(id)
               }
               return next
             })
@@ -846,7 +848,7 @@ window.__ModuleLoader__.load({
         }
 
         const selectAll = () => {
-          setSelected(new Set(sessions.filter((session) => session.live !== true).map((session) => session.id)))
+          setSelected(new Set(sessions.filter((session) => session.live !== true && session.open !== true).map((session) => session.id)))
           invalidatePreview()
         }
 
@@ -970,6 +972,7 @@ window.__ModuleLoader__.load({
             h('h2', { style: STYLE.title }, t('title')),
             h('p', { style: STYLE.intro }, t('intro')),
             h('p', { style: STYLE.note }, t('dangerNote')),
+            h('p', { style: STYLE.meta }, t('openNote')),
           ),
 
           h(

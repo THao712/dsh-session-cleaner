@@ -59,6 +59,7 @@ const MAX_EVENTS_PER_SESSION = 100000
 const CONVERSATION_BASE = 'conversations'
 const CONVERSATION_METADATA = 'session.json'
 const CONVERSATION_INDEX = 'index.json'
+const CONVERSATION_RULES = 'AGENTS.md'
 const KNOWN_FOLDER_ENTRIES = new Set(['work', 'out', CONVERSATION_METADATA, 'AGENTS.md'])
 
 const SKIP_DIRS = new Set([
@@ -1603,6 +1604,60 @@ function getPreviewToken(token) {
   return record
 }
 
+const folderPreviewTokens = new Map()
+
+function folderPreviewFingerprint(folders) {
+  const rows = (folders || [])
+    .map((folder) => [
+      folder.key,
+      folder.totalBytes,
+      folder.workBytes,
+      folder.outBytes,
+      folder.modifiedAt,
+      folder.sessionId ?? null,
+      folder.open === true,
+      folder.running === true,
+      folder.metadataState,
+      folder.unknownCount,
+    ])
+    .sort((left, right) => String(left[0]).localeCompare(String(right[0])))
+  return JSON.stringify(rows)
+}
+
+function pruneFolderPreviewTokens() {
+  const now = Date.now()
+  for (const [token, record] of folderPreviewTokens) {
+    if (record.expiresAt <= now) folderPreviewTokens.delete(token)
+  }
+  while (folderPreviewTokens.size > MAX_PREVIEW_TOKENS) {
+    const oldest = folderPreviewTokens.keys().next().value
+    if (oldest === undefined) break
+    folderPreviewTokens.delete(oldest)
+  }
+}
+
+function rememberFolderPreview(folders) {
+  pruneFolderPreviewTokens()
+  const token = randomBytes(24).toString('base64url')
+  folderPreviewTokens.set(token, {
+    fingerprint: folderPreviewFingerprint(folders),
+    expiresAt: Date.now() + PREVIEW_TOKEN_TTL_MS,
+  })
+  pruneFolderPreviewTokens()
+  return token
+}
+
+function getFolderPreviewToken(token) {
+  if (typeof token !== 'string' || token.length === 0) return undefined
+  const record = folderPreviewTokens.get(token)
+  if (record === undefined) return undefined
+  if (record.expiresAt <= Date.now()) {
+    folderPreviewTokens.delete(token)
+    return undefined
+  }
+  return record
+}
+
 function sendJson(res, status, payload) {
   if (res.headersSent) return
   res.statusCode = status
@@ -1824,6 +1879,302 @@ async function listArchived(ctx) {
     sessions,
     totalBytes: sessions.reduce((sum, session) => sum + (session.sizeBytes || 0), 0),
   }
+}
+
+async function folderStats(folder) {
+  const entries = await readdir(folder, { withFileTypes: true }).catch(() => [])
+  const names = entries.map((entry) => entry.name)
+  const hasWork = names.includes('work')
+  const hasOut = names.includes('out')
+  const workBytes = hasWork ? await sizeOfDirectory(join(folder, 'work')) : 0
+  const outBytes = hasOut ? await sizeOfDirectory(join(folder, 'out')) : 0
+  const totalBytes = await sizeOfDirectory(folder)
+  const unknownEntries = names.filter((name) => !KNOWN_FOLDER_ENTRIES.has(name))
+  const times = []
+  for (const path of [folder, hasWork ? join(folder, 'work') : undefined, hasOut ? join(folder, 'out') : undefined]) {
+    if (path === undefined) continue
+    const info = await lstatSafe(path)
+    if (info !== undefined && Number.isFinite(info.mtimeMs)) times.push(info.mtimeMs)
+  }
+  return {
+    names,
+    hasWork,
+    hasOut,
+    workBytes,
+    outBytes,
+    totalBytes,
+    unknownEntries,
+    modifiedAt: times.length > 0 ? Math.max(...times) : 0,
+  }
+}
+
+/**
+ * List every conversation folder under each registered workspace. This is a
+ * separate surface from the archive list: a folder can outlive its Session log
+ * (orphan), or belong to a Session that is not archived. It is read-only; the
+ * browser only sends the Host-derived key back for deletion.
+ */
+async function listConversationFolders(ctx) {
+  const registry = ctx.workspaceRegistry
+  const archived = new Set(registry.archivedSessionIds)
+  const snapshots = await ctx.sessionPersistence.list()
+  const logIds = new Set(snapshots.map((snapshot) => snapshot.header.id))
+  const scanWarnings = []
+  const indexed = await indexRemainingSessions(ctx, snapshots, scanWarnings)
+  const rows = []
+  for (const workspace of registry.list()) {
+    const base = join(workspace.path, CONVERSATION_BASE)
+    if (!(await isRealDirectory(base))) continue
+    const indexPath = join(base, CONVERSATION_INDEX)
+    const index = await readJsonFile(indexPath, undefined)
+    const indexEntries = index !== null && typeof index === 'object' && !Array.isArray(index) ? index : {}
+    let entries
+    try {
+      entries = await readdir(base, { withFileTypes: true })
+    } catch {
+      continue
+    }
+    for (const entry of entries) {
+      if (!entry.isDirectory()) continue
+      if (entry.name === '_unfiled' || entry.name.startsWith('.')) continue
+      if (!safeConversationName(entry.name)) continue
+      const folder = join(base, entry.name)
+      if (!(await isRealDirectory(folder))) continue
+      const metadata = await readConversationMetadata(folder)
+      const owner = Object.entries(indexEntries).find(([, value]) => {
+        if (value === null || typeof value !== 'object') return false
+        if (typeof value.folder !== 'string') return false
+        return value.folder === entry.name || samePath(isAbsolute(value.folder) ? value.folder : join(base, value.folder), folder)
+      })
+      const sessionId = typeof metadata?.sessionId === 'string'
+        ? metadata.sessionId
+        : (owner === undefined ? undefined : owner[0])
+      const metadataState = metadata === undefined
+        ? 'missing'
+        : (isConversationFolderFor(folder, metadata, sessionId, workspace.path) ? 'valid' : 'invalid')
+      const open = sessionId === undefined ? false : isSessionOpen(ctx, sessionId)
+      const running = sessionId === undefined ? false : isAgentRunning(ctx, sessionId)
+      const stats = await folderStats(folder)
+      const symlink = await hasSymlinkAncestor(folder, workspace.path)
+      const users = new Set(indexed.folders.get(pathKey(folder)) ?? [])
+      for (const [filePath, sessionIds] of indexed.paths) {
+        if (!isInside(filePath, folder)) continue
+        for (const id of sessionIds) users.add(id)
+      }
+      const sharedWith = [...users].filter((id) => id !== sessionId)
+      const referencesUnknown = indexed.unreadable
+      const allDeletable = !open && !running && !symlink && metadataState !== 'invalid' &&
+        sharedWith.length === 0 && !referencesUnknown
+      const keepOutDeletable = !open && !running && !symlink &&
+        sharedWith.length === 0 && !referencesUnknown
+      let state = 'unarchived'
+      if (running) state = 'running'
+      else if (open) state = 'open'
+      else if (metadataState === 'missing' || sessionId === undefined) state = 'orphan'
+      else if (!logIds.has(sessionId)) state = 'log-missing'
+      else if (archived.has(sessionId)) state = 'archived'
+      let reason
+      if (running) reason = 'The Session is running; stop it first.'
+      else if (open) reason = 'The Session is still loaded; restart Harness after archiving, then clean it up.'
+      else if (symlink) reason = 'The folder is reached through a symlink or junction.'
+      else if (referencesUnknown) reason = 'A Session log could not be read, so folder sharing cannot be proven safe.'
+      else if (sharedWith.length > 0) reason = `Still used by ${sharedWith.length} other Session(s).`
+      else if (metadataState === 'invalid') reason = 'The folder metadata does not match this workspace and Session; whole-folder deletion is blocked.'
+      rows.push({
+        key: `${pathKey(workspace.path)}|${entry.name}`,
+        workspace: resolve(workspace.path),
+        workspaceTitle: workspace.title,
+        name: entry.name,
+        path: folder,
+        title: typeof metadata?.title === 'string' && metadata.title.length > 0
+          ? metadata.title
+          : (typeof owner?.[1]?.title === 'string' && owner[1].title.length > 0 ? owner[1].title : entry.name),
+        sessionId,
+        metadataState,
+        state,
+        archived: sessionId === undefined ? false : archived.has(sessionId),
+        logExists: sessionId === undefined ? false : logIds.has(sessionId),
+        open,
+        running,
+        symlink,
+        sharedWith,
+        referencesUnknown,
+        allDeletable,
+        keepOutDeletable,
+        hasWork: stats.hasWork,
+        hasOut: stats.hasOut,
+        totalBytes: stats.totalBytes,
+        workBytes: stats.workBytes,
+        outBytes: stats.outBytes,
+        unknownEntries: stats.unknownEntries.slice(0, 50),
+        unknownCount: stats.unknownEntries.length,
+        modifiedAt: stats.modifiedAt,
+        reason,
+      })
+    }
+  }
+  rows.sort((left, right) => right.name.localeCompare(left.name))
+  return rows
+}
+
+async function removeConversationIndexEntriesByFolder(indexPath, base, name, warnings) {
+  for (let attempt = 0; attempt < 3; attempt += 1) {
+    const index = await readJsonFile(indexPath, undefined)
+    if (index === null || typeof index !== 'object' || Array.isArray(index)) return false
+    const ids = Object.keys(index).filter((id) => {
+      const value = index[id]
+      if (value === null || typeof value !== 'object' || typeof value.folder !== 'string') return false
+      return value.folder === name ||
+        samePath(isAbsolute(value.folder) ? value.folder : join(base, value.folder), join(base, name))
+    })
+    if (ids.length === 0) return false
+    const next = { ...index }
+    for (const id of ids) delete next[id]
+    try {
+      await writeJsonAtomic(indexPath, next)
+    } catch (error) {
+      warnings.push(`Conversation index ${indexPath}: could not remove ${name} (${formatError(error)}).`)
+      return false
+    }
+    const after = await readJsonFile(indexPath, undefined)
+    if (after !== null && typeof after === 'object' && !Array.isArray(after) &&
+        ids.every((id) => !Object.prototype.hasOwnProperty.call(after, id))) {
+      return true
+    }
+  }
+  warnings.push(`Conversation index ${indexPath}: entries for ${name} changed concurrently; refresh and retry.`)
+  return false
+}
+
+async function removeFolderTree(ctx, row, warnings) {
+  const workspace = ctx.workspaceRegistry.list().find((item) => samePath(item.path, row.workspace))
+  if (workspace === undefined) throw new Error('workspace is no longer registered')
+  const base = join(workspace.path, CONVERSATION_BASE)
+  const folder = join(base, row.name)
+  if (!(await isRealDirectory(folder))) return { removed: false, bytes: 0, reason: 'missing' }
+  if (await hasSymlinkAncestor(folder, workspace.path)) {
+    throw new Error('refusing to delete a conversation folder reached through a symlink or junction')
+  }
+  const metadata = await readConversationMetadata(folder)
+  if (metadata !== undefined) {
+    const id = typeof metadata.sessionId === 'string' ? metadata.sessionId : row.sessionId
+    if (!isConversationFolderFor(folder, metadata, id, workspace.path)) {
+      throw new Error('refusing to delete a folder whose session.json does not match this workspace')
+    }
+  }
+  const bytes = await sizeOfDirectory(folder)
+  await rm(folder, { recursive: true, force: false, maxRetries: 3 })
+  await removeConversationIndexEntriesByFolder(join(base, CONVERSATION_INDEX), base, row.name, warnings)
+  return { removed: true, bytes }
+}
+
+async function keepFolderOut(ctx, row, warnings) {
+  const workspace = ctx.workspaceRegistry.list().find((item) => samePath(item.path, row.workspace))
+  if (workspace === undefined) throw new Error('workspace is no longer registered')
+  const base = join(workspace.path, CONVERSATION_BASE)
+  const folder = join(base, row.name)
+  if (!(await isRealDirectory(folder))) return { removed: false, workBytes: 0, agentsBytes: 0, outBytes: 0, reason: 'missing' }
+  if (await hasSymlinkAncestor(folder, workspace.path)) {
+    throw new Error('refusing to clean a conversation folder reached through a symlink or junction')
+  }
+  let workBytes = 0
+  let agentsBytes = 0
+  const work = join(folder, 'work')
+  const workInfo = await lstatSafe(work)
+  if (workInfo !== undefined) {
+    if (workInfo.isSymbolicLink()) throw new Error('refusing to delete a work directory that is a symlink')
+    if (!workInfo.isDirectory()) throw new Error('refusing to delete a work entry that is not a directory')
+    workBytes = await sizeOfDirectory(work)
+    await rm(work, { recursive: true, force: false, maxRetries: 3 })
+  }
+  const rules = join(folder, CONVERSATION_RULES)
+  const rulesInfo = await lstatSafe(rules)
+  if (rulesInfo !== undefined) {
+    if (rulesInfo.isSymbolicLink()) {
+      warnings.push(`Conversation folder ${row.name}: ${CONVERSATION_RULES} is a symlink and was kept.`)
+    } else if (rulesInfo.isFile()) {
+      agentsBytes = rulesInfo.size
+      await unlink(rules)
+    }
+  }
+  return {
+    removed: workBytes > 0 || agentsBytes > 0,
+    workBytes,
+    agentsBytes,
+    outBytes: row.outBytes,
+  }
+}
+
+async function executeFolderDeletion(ctx, body, tokenRecord) {
+  if (tokenRecord === undefined) {
+    throw new HttpError(409, 'folder-preview-required', 'Refresh the conversation folder list before deleting.')
+  }
+  if (body.confirmed !== true) {
+    throw new HttpError(400, 'confirmation-required', 'Confirm the folder cleanup first.')
+  }
+  const requested = Array.isArray(body.folders)
+    ? body.folders.filter((item) => item !== null && typeof item === 'object' && typeof item.key === 'string')
+    : []
+  if (requested.length === 0) throw new HttpError(400, 'no-folders', 'Select at least one conversation folder.')
+  const preview = await listConversationFolders(ctx)
+  if (folderPreviewFingerprint(preview) !== tokenRecord.fingerprint) {
+    throw new HttpError(409, 'stale-preview', 'The conversation folders changed. Refresh and preview again.')
+  }
+  const byKey = new Map(preview.map((folder) => [folder.key, folder]))
+  const report = {
+    folders: { requested: requested.length, removed: 0, keptOut: 0, skipped: 0 },
+    bytes: { removed: 0, workRemoved: 0, outKept: 0 },
+    errors: [],
+    warnings: [],
+  }
+  const seen = new Set()
+  for (const item of requested) {
+    if (seen.has(item.key)) continue
+    seen.add(item.key)
+    const row = byKey.get(item.key)
+    if (row === undefined) {
+      throw new HttpError(409, 'stale-preview', 'A conversation folder is no longer listed. Refresh and preview again.')
+    }
+    const mode = item.mode === 'all' ? 'all' : 'keepOut'
+    if (row.open || row.running) {
+      report.folders.skipped += 1
+      report.errors.push({ scope: 'folder', id: row.name, message: row.reason ?? 'The Session is still loaded.' })
+      continue
+    }
+    if (mode === 'all' && row.allDeletable !== true) {
+      report.folders.skipped += 1
+      report.errors.push({ scope: 'folder', id: row.name, message: row.reason ?? 'Whole-folder deletion is not allowed.' })
+      continue
+    }
+    if (mode === 'keepOut' && row.keepOutDeletable !== true) {
+      report.folders.skipped += 1
+      report.errors.push({ scope: 'folder', id: row.name, message: row.reason ?? 'This folder cannot be cleaned.' })
+      continue
+    }
+    try {
+      if (mode === 'all') {
+        const removal = await removeFolderTree(ctx, row, report.warnings)
+        if (removal.removed) {
+          report.folders.removed += 1
+          report.bytes.removed += removal.bytes
+          report.bytes.workRemoved += row.workBytes
+        } else {
+          report.folders.skipped += 1
+        }
+      } else {
+        const removal = await keepFolderOut(ctx, row, report.warnings)
+        report.folders.keptOut += 1
+        report.bytes.removed += removal.workBytes + removal.agentsBytes
+        report.bytes.workRemoved += removal.workBytes
+        report.bytes.outKept += removal.outBytes
+      }
+    } catch (error) {
+      report.folders.skipped += 1
+      report.errors.push({ scope: 'folder', id: row.name, message: formatError(error) })
+    }
+  }
+  folderPreviewTokens.delete(body.previewToken)
+  return report
 }
 
 async function writeJsonAtomic(path, value) {
@@ -2263,6 +2614,17 @@ export function apply(ctx) {
       if (op === 'delete') {
         const tokenRecord = getPreviewToken(body.previewToken)
         sendJson(res, 200, { ok: true, value: await executeDeletion(ctx, body, tokenRecord) })
+        return
+      }
+      if (op === 'folders') {
+        const folders = await listConversationFolders(ctx)
+        const previewToken = rememberFolderPreview(folders)
+        sendJson(res, 200, { ok: true, value: { folders, previewToken } })
+        return
+      }
+      if (op === 'folders-delete') {
+        const tokenRecord = getFolderPreviewToken(body.previewToken)
+        sendJson(res, 200, { ok: true, value: await executeFolderDeletion(ctx, body, tokenRecord) })
         return
       }
       sendJson(res, 400, { ok: false, error: { code: 'unknown-op', message: 'Unknown operation.' } })

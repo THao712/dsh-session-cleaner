@@ -10,7 +10,7 @@ A DeepSeek Harness plugin that previews and permanently deletes archived Session
 
 对每个选中的已归档会话，插件会清理：
 
-1. **会话专用目录**（session-archive）：`<工作区>/conversations/<时间_标题>/`，包括 `work/`、`out/`、`session.json` 与 `AGENTS.md` 副本；同时从 `conversations/index.json` 移除该会话的映射。若目录仍被其他会话（包括子会话/分叉）使用，或含有 `work/out/session.json/AGENTS.md` 之外的顶层项，则默认保留；未知项需要显式勾选“同时删除会话目录中的其他文件”。
+1. **会话专用目录（可选）**（session-archive）：`<工作区>/conversations/<时间_标题>/`，包括 `work/`、`out/`、`session.json` 与 `AGENTS.md` 副本；同时从 `conversations/index.json` 移除该会话的映射。会话清理里该选项默认关闭；需要整目录删除时才勾选。若要保留 `out/`，使用独立的“对话目录”清理。
 2. **会话日志**：`<DSH_HOME>/sessions/<项目目录>/<会话ID>/`（当前与历史格式文件、锁文件）。
 3. **投影检查点**：`<DSH_HOME>/storages/session_projcache/sessions/<会话ID>.json`，并同步 `session_projcache` 存储域内存。
 4. **工作区归档记录**：从 `workspace` 域的归档集合、置顶集合和项目 `sessionIds` 中移除；不会删除整个工作区或其他会话。
@@ -18,6 +18,10 @@ A DeepSeek Harness plugin that previews and permanently deletes archived Session
 6. **会话的工具输出溢出目录**：`dsh-spill-*` 根下以 `session-<sha256(id)[0..12]>` 命名的目录（包括当前与以往进程的默认根）。
 7. **会话在工作区产生的文件**：来源包括 `write` / `edit` / `str_replace_editor` / `present` 的显式路径，以及会话时间窗内新建文件的目录扫描（用于 shell、Python 等命令生成的中间脚本和最终产物）。会话目录内的文件随目录整体删除，不会重复列出。
 8. **可选的附件请求缓存**：`<DSH_HOME>/cache/attachments/request-images`，可重建，不影响其他会话。
+9. **对话目录清理（独立功能）**：扫描每个工作区 `conversations/` 下的所有目录，包括会话记录已不存在的残留目录。每个目录可以选：
+   - **保留 out**：删除 `work/` 与 `AGENTS.md` 副本，保留 `out/`、`session.json` 和其他未知文件；
+   - **全部删除**：删除整个目录，并移除 `index.json` 中指向它的条目。
+   目录清理只处理目录内容，不删除会话日志/附件；会话记录仍用上面的“会话清理”。
 
 ## 安全模型
 
@@ -49,16 +53,18 @@ plugin_manager install_bundle  target: <克隆目录的绝对路径>
 
 1. 勾选要删除的已归档会话。
 2. 每条会话右侧的 **文件夹图标** 会优先打开 session-archive 为该对话创建的会话专用目录；没有专用目录时，回退到日志中的 `working_directory`/文件路径推导出的项目根目录，再回退到 `cwd` 或工作区目录。目录已被删除时只回退到仍存在的上层目录，不会创建目录。
-3. 选择清理范围（会话专用目录、附件、工作区文件、时间窗扫描、工具输出溢出目录、图片请求缓存）。默认会整目录删除会话专用目录；若目录被其他会话共用或含有未知顶层项，预览会保留它并说明原因。未知顶层项需要显式勾选“同时删除会话目录中的其他文件”。
+3. 选择清理范围（附件、工作区文件、时间窗扫描、工具输出溢出目录、图片请求缓存）。**会话目录清理默认关闭**；需要整目录删除时再勾选“同时整目录删除会话专用目录（不保留 out）”。
 4. 点击 **预览清理**，逐项检查路径；可取消任意文件或附件。工作区外、共享引用、引用状态未知的文件会被禁用，不能删除。
 5. 点击 **永久删除所选内容**，再点击 **确认永久删除**。Host 会核对本次预览 token；若预览后选择或候选发生变化，需要重新预览。
 6. 查看结果报告；若侧边栏仍显示已删除会话，刷新页面。
+7. **对话目录清理**（同一页面下方）：勾选要处理的 `conversations/<目录>`，选择 **保留 out** 或 **全部删除**，先 **预览目录清理**，再两次确认执行。该列表包含没有会话记录的残留目录；`已打开（需重启）`的目录需要先重启 Harness。
 
 ## 接口与实现
 
 - Host：`@local/session-cleaner` 的 `index.js`，注册 `POST /dsh-session-cleaner/api`，使用 `connection.requestRejection()` 做 Host/Origin 围栏与登录态校验。
 - Client：`client.js` 注册 `settings.section`（id `session-cleaner`）。
 - `preview` 返回短期 `previewToken`；`delete` 必须携带该 token，并重新推导候选、比较指纹，避免执行用户没看过的预览。
+- 对话目录：`folders` 返回目录清单与 `previewToken`；`folders-delete` 必须携带 token，并重新扫描、比较目录大小/修改时间/状态指纹。删除前再次校验目录位于 `conversations/` 直接子目录、不是 symlink/Junction、元数据匹配（有 `session.json` 时），并拒绝仍被 Host 加载的目录。
 - 会话日志路径由 JSONL 后端的确定性布局推导，并在删除前再次校验目录名与根目录归属。
 - 删除顺序：先完成会话目录/检查点/日志的文件系统删除，成功后才 detach/unarchive；失败时保留归档状态和原工作区位置。
 - 兼容 `@local/session-archive`：读取 `conversations/index.json` 与每个目录的 `session.json`，并消费 `working-directory/change` 事件，因此相对工具路径会按会话专用目录解析。
@@ -67,6 +73,8 @@ plugin_manager install_bundle  target: <克隆目录的绝对路径>
 ## 已知边界
 
 - Harness 的持久化接口没有删除 API；会话日志与附件对象必须由本插件直接删除文件。Agent 正在运行、或 Session 仍被 Host 加载的会话都会被拒绝；前者请先停止，后者请关闭会话或重启 Harness。否则删除会让它在侧边栏以“未分组”残留。
+- 对话目录清理独立于会话清理：它只处理 `conversations/` 下的文件，不删除会话日志、投影检查点或附件；`保留 out` 只删除 `work/` 和 `AGENTS.md`，保留 `out/`、`session.json` 及未知顶层文件；`全部删除` 删除整个目录并移除 `index.json` 中指向该目录的条目。残留目录、未归档会话目录都会列出。
+- 对话目录删除前会扫描所有会话日志与当前 live events，仍被其他会话使用（cwd 或显式文件路径位于该目录）的目录会阻止删除；运行中/已加载目录也会禁用。但其他进程、未提交草稿、外部程序直接引用目录内文件的情况无法完全证明安全。
 - 工作区文件候选依赖工具调用记录与文件创建时间；扫描到的文件默认不勾选，需要在预览中确认。通过 shell 修改既有文件（而非新建）不会自动列出。
 - 会话专用目录只在该目录存在且 `session.json` 完整匹配当前会话时才会删除；缺少或损坏 `session.json` 时只清理日志，不会猜测目录。目录仍被其他会话使用、含未知顶层项、或其余会话引用状态未知时，整目录删除会被阻止。
 - 自定义 `baseDir` 的会话在日志里有 `working-directory/change` 时可由 facts 识别；若 `applyDirectory:false` 且没有切换过目录，且 baseDir 不是默认 `conversations`，列表和预览可能无法自动发现目录。此时建议先用默认 baseDir 或让会话切换一次目录。
@@ -86,7 +94,7 @@ plugin_manager install_bundle  target: <克隆目录的绝对路径>
 npm test
 ```
 
-回归测试覆盖：预览 token 单次使用、工作区外文件、不可读的其余会话、symlink/Junction 祖先、投影缓存实际删除、共享会话目录、未知目录项、索引保留其他条目、默认选项、运行中会话引用、detach 失败、嵌套 baseDir。
+回归测试覆盖：预览 token 单次使用、工作区外文件、不可读的其余会话、symlink/Junction 祖先、投影缓存实际删除、共享会话目录、未知目录项、索引保留其他条目、默认选项、运行中会话引用、detach 失败、嵌套 baseDir，以及对话目录的保留 out/全部删除、残留目录、已加载目录阻止。
 
 ## License
 

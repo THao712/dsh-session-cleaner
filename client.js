@@ -44,8 +44,8 @@ window.__ModuleLoader__.load({
         openWorkspaceFailed: '无法打开目录：{message}',
         noWorkspacePath: '该会话没有可打开的目录',
         optionsTitle: '清理范围',
-        optConversationFolder: '删除会话专用目录',
-        optConversationFolderHint: '删除 session-archive 为每个对话创建的 conversations/<时间_标题>/ 目录，包括 work、out、session.json 与 AGENTS.md 副本；同时移除 index.json 中的映射。若目录仍被其他会话使用，或含有未知顶层文件，则默认保留。',
+        optConversationFolder: '同时整目录删除会话专用目录（不保留 out）',
+        optConversationFolderHint: '删除 conversations/<时间_标题>/ 整个目录，包括 work、out、session.json 与 AGENTS.md 副本；同时移除 index.json 中的映射。若要保留 out/ 终产物，请保持此项关闭，使用下方“对话目录”的“保留 out”。',
         optFolderUnknown: '同时删除会话目录中的其他文件',
         optFolderUnknownHint: '仅在目录含有 work/out/session.json/AGENTS.md 之外的文件时需要。默认关闭；关闭时整目录删除会被阻止，未知文件会列在预览中。',
         optAttachments: '删除仅被这些会话引用的附件',
@@ -67,6 +67,44 @@ window.__ModuleLoader__.load({
         attachmentsSection: '附件',
         filesSection: '工作区文件',
         spillsSection: '工具输出临时文件',
+        foldersTitle: '对话目录',
+        foldersIntro: '扫描每个工作区 conversations 下的会话目录。out/ 是终产物，work/ 是中间文件；残留目录通常是会话记录已删除但文件夹还在。',
+        foldersEmpty: '没有找到对话目录。',
+        foldersLoading: '正在读取对话目录…',
+        foldersFailed: '读取对话目录失败：{message}',
+        folderSelectAll: '全选目录',
+        folderClear: '清空目录',
+        folderKeepOut: '保留 out',
+        folderDeleteAll: '全部删除',
+        folderWorkBytes: '中间文件',
+        folderOutBytes: '终产物',
+        folderTotalBytes: '目录合计',
+        folderStateArchived: '已归档',
+        folderStateUnarchived: '未归档',
+        folderStateOrphan: '无会话记录',
+        folderStateLogMissing: '日志缺失',
+        folderStateOpen: '已打开',
+        folderStateRunning: '运行中',
+        folderUnknownCount: '未知顶层项 {count}',
+        folderSelected: '已选 {count} 个目录 · 将释放 {size}',
+        folderPreview: '预览目录清理',
+        folderPreviewing: '正在核对目录…',
+        folderPreviewFailed: '目录预览失败：{message}',
+        folderPlanTitle: '目录清理计划',
+        folderPlanKeep: '保留 out，删除 work 与 AGENTS.md',
+        folderPlanAll: '删除整个目录',
+        folderPlanKept: '保留终产物 {size}',
+        folderDelete: '执行目录清理',
+        folderConfirm: '确认目录清理',
+        folderDeleting: '正在清理…',
+        folderDone: '目录清理完成',
+        folderResult: '处理 {folders} 个目录，删除 {removed} 个，保留 out {kept} 个，释放 {bytes}，保留终产物 {outBytes}。',
+        folderErrors: '未完成的目录',
+        folderNoSelection: '请选择至少一个目录。',
+        folderStale: '目录已变化，已清除选择。请刷新后重试。',
+        folderOpenBlocked: '仍被 Harness 加载，需重启后再清理',
+        folderMetadataInvalid: '目录元数据不匹配，不能整目录删除',
+        folderKeepHint: '保留 out：删除 work/ 与 AGENTS.md，其他文件不动。',
         warnings: '提示',
         noAttachments: '没有被这些会话引用的附件。',
         noFiles: '没有发现可清理的工作区文件。',
@@ -169,8 +207,8 @@ window.__ModuleLoader__.load({
         openWorkspaceFailed: 'Could not open the directory: {message}',
         noWorkspacePath: 'This Session has no openable directory.',
         optionsTitle: 'Cleanup scope',
-        optConversationFolder: 'Delete the per-Session conversation folder',
-        optConversationFolderHint: 'Removes the conversations/<timestamp_title>/ folder created by session-archive, including work, out, session.json, and the AGENTS.md copy; its index.json entry is removed too. The folder is kept when another Session still uses it or it contains unexpected top-level entries.',
+        optConversationFolder: 'Also delete the whole conversation folder (does not keep out/)',
+        optConversationFolderHint: 'Removes the entire conversations/<timestamp_title>/ folder, including work, out, session.json, and the AGENTS.md copy; its index.json entry is removed too. To keep out/ deliverables, leave this off and use “Keep out/” in Conversation folders below.',
         optFolderUnknown: 'Also delete unexpected files in the conversation folder',
         optFolderUnknownHint: 'Only needed when the folder contains entries other than work/out/session.json/AGENTS.md. Off by default; while off, whole-folder deletion is blocked and the entries are listed in the preview.',
         optAttachments: 'Delete attachments referenced only by these Sessions',
@@ -192,6 +230,44 @@ window.__ModuleLoader__.load({
         attachmentsSection: 'Attachments',
         filesSection: 'Workspace files',
         spillsSection: 'Spilled tool output',
+        foldersTitle: 'Conversation folders',
+        foldersIntro: 'Scans the conversation folders under each workspace conversations directory. out/ holds deliverables and work/ holds intermediate files; leftovers are usually folders whose Session log is already gone.',
+        foldersEmpty: 'No conversation folder was found.',
+        foldersLoading: 'Reading conversation folders…',
+        foldersFailed: 'Could not read conversation folders: {message}',
+        folderSelectAll: 'Select all folders',
+        folderClear: 'Clear folders',
+        folderKeepOut: 'Keep out/',
+        folderDeleteAll: 'Delete all',
+        folderWorkBytes: 'Intermediate',
+        folderOutBytes: 'Deliverables',
+        folderTotalBytes: 'Folder total',
+        folderStateArchived: 'Archived',
+        folderStateUnarchived: 'Not archived',
+        folderStateOrphan: 'No Session record',
+        folderStateLogMissing: 'Log missing',
+        folderStateOpen: 'Open',
+        folderStateRunning: 'Running',
+        folderUnknownCount: '{count} unexpected entries',
+        folderSelected: '{count} folder(s) selected · {size} will be freed',
+        folderPreview: 'Preview folder cleanup',
+        folderPreviewing: 'Checking folders…',
+        folderPreviewFailed: 'Folder preview failed: {message}',
+        folderPlanTitle: 'Folder cleanup plan',
+        folderPlanKeep: 'Keep out/; delete work/ and AGENTS.md',
+        folderPlanAll: 'Delete the whole folder',
+        folderPlanKept: 'Keeping deliverables {size}',
+        folderDelete: 'Run folder cleanup',
+        folderConfirm: 'Confirm folder cleanup',
+        folderDeleting: 'Cleaning…',
+        folderDone: 'Folder cleanup complete',
+        folderResult: 'Processed {folders} folder(s): deleted {removed}, kept out/ in {kept}, freed {bytes}, kept deliverables {outBytes}.',
+        folderErrors: 'Folders not completed',
+        folderNoSelection: 'Select at least one folder.',
+        folderStale: 'The folders changed; the selection was cleared. Refresh and try again.',
+        folderOpenBlocked: 'Still loaded by Harness; restart before cleaning',
+        folderMetadataInvalid: 'Folder metadata does not match; whole-folder deletion is blocked',
+        folderKeepHint: 'Keep out/: deletes work/ and AGENTS.md; leaves other files untouched.',
         warnings: 'Notes',
         noAttachments: 'No attachment is referenced by these Sessions.',
         noFiles: 'No workspace file was found to clean up.',
@@ -691,12 +767,120 @@ window.__ModuleLoader__.load({
         )
       }
 
+      function FolderRow(props) {
+        const folder = props.folder
+        const selected = props.mode !== null
+        const disabled = folder.keepOutDeletable !== true
+        const stateLabel = folder.state === 'running'
+          ? t('folderStateRunning')
+          : folder.state === 'open'
+            ? t('folderStateOpen')
+            : folder.state === 'orphan'
+              ? t('folderStateOrphan')
+              : folder.state === 'log-missing'
+                ? t('folderStateLogMissing')
+                : folder.state === 'archived'
+                  ? t('folderStateArchived')
+                  : t('folderStateUnarchived')
+        const reasonText = folder.running
+          ? t('folderStateRunning')
+          : folder.open
+            ? t('folderOpenBlocked')
+            : folder.symlink
+              ? t('symlinkAncestor')
+              : folder.referencesUnknown
+                ? t('referencesUnknown')
+                : folder.sharedWith && folder.sharedWith.length > 0
+                  ? t('sharedWith', { count: folder.sharedWith.length })
+                  : folder.metadataState === 'invalid'
+                    ? t('folderMetadataInvalid')
+                    : folder.reason
+        return h(
+          'div',
+          { style: { ...STYLE.row, ...(props.last ? STYLE.rowLast : {}) } },
+          h(Check, {
+            checked: selected,
+            disabled,
+            onChange: () => props.onToggle(folder.key),
+            label: folder.name,
+          }),
+          h(
+            'div',
+            { style: STYLE.grow },
+            h(
+              'div',
+              { style: STYLE.strong },
+              folder.name,
+              previewBadge(stateLabel, folder.state === 'running' || folder.state === 'open'
+                ? STYLE.badgeWarn
+                : folder.state === 'log-missing' || folder.state === 'orphan'
+                  ? STYLE.badgeDanger
+                  : {}),
+              folder.metadataState === 'invalid'
+                ? previewBadge(t('folderMetadataInvalid'), STYLE.badgeDanger)
+                : null,
+              folder.referencesUnknown
+                ? previewBadge(t('referencesUnknown'), STYLE.badgeWarn)
+                : null,
+              folder.sharedWith && folder.sharedWith.length > 0
+                ? previewBadge(t('sharedWith', { count: folder.sharedWith.length }), STYLE.badgeWarn)
+                : null,
+              folder.unknownCount > 0
+                ? previewBadge(t('folderUnknownCount', { count: folder.unknownCount }), STYLE.badgeWarn)
+                : null,
+            ),
+            h(
+              'div',
+              { style: STYLE.meta },
+              `${folder.workspaceTitle} · ${t('folderTotalBytes')} ${formatBytes(folder.totalBytes)} · ${t('folderWorkBytes')} ${formatBytes(folder.workBytes)} · ${t('folderOutBytes')} ${formatBytes(folder.outBytes)}`,
+            ),
+            h('div', { style: STYLE.mono }, folder.sessionId || '—'),
+            selected
+              ? h(
+                  'div',
+                  { style: { ...STYLE.inline, marginTop: 6 } },
+                  h(
+                    'button',
+                    {
+                      type: 'button',
+                      style: {
+                        ...STYLE.button,
+                        ...(props.mode === 'keepOut' ? STYLE.primary : {}),
+                        ...(folder.keepOutDeletable === true ? {} : STYLE.disabled),
+                      },
+                      disabled: folder.keepOutDeletable !== true,
+                      onClick: () => props.onMode(folder.key, 'keepOut'),
+                    },
+                    t('folderKeepOut'),
+                  ),
+                  h(
+                    'button',
+                    {
+                      type: 'button',
+                      style: {
+                        ...STYLE.button,
+                        ...(props.mode === 'all' ? STYLE.danger : {}),
+                        ...(folder.allDeletable === true ? {} : STYLE.disabled),
+                      },
+                      disabled: folder.allDeletable !== true,
+                      onClick: () => props.onMode(folder.key, 'all'),
+                    },
+                    t('folderDeleteAll'),
+                  ),
+                  h('span', { style: STYLE.meta }, t('folderKeepHint')),
+                )
+              : null,
+            reasonText ? h('div', { style: STYLE.warn }, reasonText) : null,
+          ),
+        )
+      }
+
       function CleanupPage() {
         const [phase, setPhase] = useState('loading')
         const [sessions, setSessions] = useState([])
         const [selected, setSelected] = useState(() => new Set())
         const [options, setOptions] = useState({
-          conversationFolder: true,
+          conversationFolder: false,
           allowUnknownFolderEntries: false,
           attachments: true,
           workspaceFiles: true,
@@ -717,14 +901,51 @@ window.__ModuleLoader__.load({
         const [report, setReport] = useState(null)
         const [openingId, setOpeningId] = useState(null)
         const [openError, setOpenError] = useState(null)
+        const [folders, setFolders] = useState([])
+        const [folderPhase, setFolderPhase] = useState('loading')
+        const [folderError, setFolderError] = useState(null)
+        const [folderChoice, setFolderChoice] = useState(() => new Map())
+        const [folderToken, setFolderToken] = useState(null)
+        const [folderPlan, setFolderPlan] = useState(null)
+        const [folderConfirming, setFolderConfirming] = useState(false)
+        const [folderDeleting, setFolderDeleting] = useState(false)
+        const [folderReport, setFolderReport] = useState(null)
         const requestSeq = useRef(0)
         const loadAbort = useRef(null)
         const previewAbort = useRef(null)
+        const folderSeq = useRef(0)
 
         const messageOf = (error) => {
           if (error && (error.name === 'AbortError' || error.name === 'TimeoutError')) return t('requestTimeout')
           return error instanceof Error ? error.message : String(error)
         }
+
+        const loadFolders = useCallback(async () => {
+          const seq = ++folderSeq.current
+          setFolderPhase('loading')
+          setFolderError(null)
+          try {
+            const value = await callApi('folders', {}, { timeoutMs: 180000 })
+            if (seq !== folderSeq.current) return
+            const list = Array.isArray(value.folders) ? value.folders : []
+            setFolders(list)
+            setFolderToken(typeof value.previewToken === 'string' ? value.previewToken : null)
+            setFolderChoice((previous) => {
+              const next = new Map()
+              for (const [key, mode] of previous) {
+                if (list.some((folder) => folder.key === key && folder.keepOutDeletable === true)) next.set(key, mode)
+              }
+              return next
+            })
+            setFolderPlan(null)
+            setFolderConfirming(false)
+            setFolderPhase('ready')
+          } catch (error) {
+            if (seq !== folderSeq.current) return
+            setFolderPhase('error')
+            setFolderError(messageOf(error))
+          }
+        }, [])
 
         const load = useCallback(async () => {
           const seq = ++requestSeq.current
@@ -769,11 +990,13 @@ window.__ModuleLoader__.load({
 
         useEffect(() => {
           load()
+          loadFolders()
           return () => {
             loadAbort.current?.abort()
             previewAbort.current?.abort()
+            folderSeq.current += 1
           }
-        }, [load])
+        }, [load, loadFolders])
 
         const openWorkspace = async (session) => {
           setOpeningId(session.id)
@@ -933,6 +1156,7 @@ window.__ModuleLoader__.load({
               /* the list below still refreshes from the Host */
             }
             await load()
+            await loadFolders()
           } catch (error) {
             const message = messageOf(error)
             if (error && (error.code === 'stale-preview' || error.code === 'preview-required')) {
@@ -950,6 +1174,116 @@ window.__ModuleLoader__.load({
         const cancelDelete = () => {
           setConfirming(false)
           setDeleteError(null)
+        }
+
+        const selectedFolders = useMemo(
+          () => folders.filter((folder) => folderChoice.has(folder.key)),
+          [folders, folderChoice],
+        )
+        const folderFreedBytes = useMemo(
+          () => selectedFolders.reduce((sum, folder) => {
+            const mode = folderChoice.get(folder.key)
+            return sum + (mode === 'all' ? folder.totalBytes : folder.workBytes)
+          }, 0),
+          [selectedFolders, folderChoice],
+        )
+        const folderOutKeptBytes = useMemo(
+          () => selectedFolders.reduce((sum, folder) => sum + (folderChoice.get(folder.key) === 'keepOut' ? folder.outBytes : 0), 0),
+          [selectedFolders, folderChoice],
+        )
+
+        const invalidateFolderPlan = () => {
+          setFolderPlan(null)
+          setFolderConfirming(false)
+          setFolderError(null)
+          setFolderReport(null)
+        }
+
+        const toggleFolder = (key) => {
+          setFolderChoice((previous) => {
+            const next = new Map(previous)
+            if (next.has(key)) next.delete(key)
+            else next.set(key, 'keepOut')
+            return next
+          })
+          invalidateFolderPlan()
+        }
+
+        const setFolderMode = (key, mode) => {
+          setFolderChoice((previous) => {
+            const next = new Map(previous)
+            next.set(key, mode)
+            return next
+          })
+          invalidateFolderPlan()
+        }
+
+        const selectAllFolders = () => {
+          setFolderChoice(new Map(folders
+            .filter((folder) => folder.keepOutDeletable === true)
+            .map((folder) => [folder.key, 'keepOut'])))
+          invalidateFolderPlan()
+        }
+
+        const clearFolders = () => {
+          setFolderChoice(new Map())
+          invalidateFolderPlan()
+        }
+
+        const previewFoldersNow = () => {
+          if (selectedFolders.length === 0) {
+            setFolderError(t('folderNoSelection'))
+            return
+          }
+          setFolderError(null)
+          setFolderReport(null)
+          setFolderConfirming(false)
+          setFolderPlan({
+            rows: selectedFolders.map((folder) => ({
+              key: folder.key,
+              name: folder.name,
+              mode: folderChoice.get(folder.key) === 'all' ? 'all' : 'keepOut',
+              totalBytes: folder.totalBytes,
+              workBytes: folder.workBytes,
+              outBytes: folder.outBytes,
+              unknownCount: folder.unknownCount,
+            })),
+          })
+        }
+
+        const folderDeleteNow = async () => {
+          if (folderPlan === null || folderToken === null || folderConfirming !== true || folderDeleting) return
+          setFolderDeleting(true)
+          setFolderError(null)
+          try {
+            const value = await callApi('folders-delete', {
+              previewToken: folderToken,
+              confirmed: true,
+              folders: folderPlan.rows.map((row) => ({ key: row.key, mode: row.mode })),
+            }, { timeoutMs: 900000 })
+            setFolderReport(value)
+            setFolderPlan(null)
+            setFolderConfirming(false)
+            setFolderChoice(new Map())
+            await loadFolders()
+          } catch (error) {
+            if (error && (error.code === 'stale-preview' || error.code === 'folder-preview-required')) {
+              setFolderPlan(null)
+              setFolderConfirming(false)
+              setFolderChoice(new Map())
+              setFolderError(t('folderStale'))
+              await loadFolders()
+            } else {
+              setFolderError(messageOf(error))
+            }
+          } finally {
+            setFolderDeleting(false)
+          }
+        }
+
+        const cancelFolderDelete = () => {
+          setFolderConfirming(false)
+          setFolderError(null)
         }
 
         const totalSelectedBytes = useMemo(
@@ -1318,6 +1652,138 @@ window.__ModuleLoader__.load({
                 ),
               )
             : null,
+
+          h(
+            'section',
+            { style: STYLE.card },
+            h(
+              'div',
+              { style: STYLE.cardHead },
+              h('h3', { style: STYLE.cardTitle }, `${t('foldersTitle')} · ${folders.length}`),
+              h(
+                'div',
+                { style: STYLE.inline },
+                h('button', { type: 'button', style: STYLE.button, onClick: selectAllFolders, disabled: folders.length === 0 }, t('folderSelectAll')),
+                h('button', { type: 'button', style: STYLE.button, onClick: clearFolders, disabled: folderChoice.size === 0 }, t('folderClear')),
+                h('button', { type: 'button', style: STYLE.button, onClick: loadFolders }, t('refresh')),
+              ),
+            ),
+            h(
+              'div',
+              { style: STYLE.cardBody },
+              h('p', { style: STYLE.meta }, t('foldersIntro')),
+              folderPhase === 'loading'
+                ? h('div', { style: STYLE.empty }, t('foldersLoading'))
+                : folderPhase === 'error'
+                  ? h('div', { style: STYLE.error }, t('foldersFailed', { message: folderError || '' }))
+                  : folders.length === 0
+                    ? h('div', { style: STYLE.empty }, t('foldersEmpty'))
+                    : h(
+                        'div',
+                        { style: STYLE.list },
+                        folders.map((folder, index) => h(FolderRow, {
+                          key: folder.key,
+                          folder,
+                          mode: folderChoice.get(folder.key) ?? null,
+                          onToggle: toggleFolder,
+                          onMode: setFolderMode,
+                          last: index === folders.length - 1,
+                        })),
+                      ),
+              h(
+                'div',
+                { style: { ...STYLE.actions, marginTop: 10 } },
+                h('span', { style: STYLE.meta }, `${t('folderSelected', { count: selectedFolders.length, size: formatBytes(folderFreedBytes) })} · ${t('folderPlanKept', { size: formatBytes(folderOutKeptBytes) })}`),
+                h('span', { style: STYLE.spacer }),
+                h(
+                  'button',
+                  {
+                    type: 'button',
+                    style: { ...STYLE.button, ...STYLE.primary, ...(selectedFolders.length === 0 || folderDeleting ? STYLE.disabled : {}) },
+                    disabled: selectedFolders.length === 0 || folderDeleting,
+                    onClick: previewFoldersNow,
+                  },
+                  t('folderPreview'),
+                ),
+              ),
+              folderError ? h('div', { style: { ...STYLE.error, marginTop: 8 } }, folderError) : null,
+              folderPlan !== null
+                ? h(
+                    'div',
+                    { style: { ...STYLE.confirmBox, borderColor: 'var(--dsw-alias-border-l2)' } },
+                    h('h4', { style: STYLE.cardTitle }, t('folderPlanTitle')),
+                    folderPlan.rows.map((row) => h(
+                      'div',
+                      { key: row.key, style: { ...STYLE.row, ...(row === folderPlan.rows[folderPlan.rows.length - 1] ? STYLE.rowLast : {}) } },
+                      h('div', { style: STYLE.grow },
+                        h('div', { style: STYLE.strong }, row.name),
+                        h('div', { style: STYLE.meta }, row.mode === 'all'
+                          ? t('folderPlanAll')
+                          : t('folderPlanKeep'),
+                        row.mode === 'keepOut' ? ` · ${t('folderPlanKept', { size: formatBytes(row.outBytes) })}` : '',
+                        row.unknownCount > 0 ? ` · ${t('folderUnknownCount', { count: row.unknownCount })}` : ''),
+                      ),
+                    )),
+                    folderConfirming
+                      ? h(
+                          'div',
+                          { style: { ...STYLE.confirmRow, marginTop: 10 } },
+                          h('button', {
+                            type: 'button',
+                            style: { ...STYLE.button, ...STYLE.danger, ...(folderDeleting ? STYLE.disabled : {}) },
+                            disabled: folderDeleting,
+                            onClick: folderDeleteNow,
+                          }, folderDeleting ? t('folderDeleting') : t('folderConfirm')),
+                          h('button', {
+                            type: 'button',
+                            style: { ...STYLE.button, ...(folderDeleting ? STYLE.disabled : {}) },
+                            disabled: folderDeleting,
+                            onClick: cancelFolderDelete,
+                          }, t('cancel')),
+                        )
+                      : h(
+                          'div',
+                          { style: { ...STYLE.confirmRow, marginTop: 10 } },
+                          h('button', {
+                            type: 'button',
+                            style: { ...STYLE.button, ...STYLE.dangerGhost },
+                            onClick: () => setFolderConfirming(true),
+                          }, t('folderDelete')),
+                          h('button', {
+                            type: 'button',
+                            style: STYLE.button,
+                            onClick: () => { setFolderPlan(null); setFolderConfirming(false) },
+                          }, t('cancel')),
+                        ),
+                  )
+                : null,
+              folderReport !== null
+                ? h(
+                    'div',
+                    { style: { ...STYLE.confirmBox, marginTop: 10, borderColor: 'var(--dsw-alias-border-l2)' } },
+                    h('h4', { style: STYLE.cardTitle }, t('folderDone')),
+                    h('p', { style: STYLE.ok }, t('folderResult', {
+                      folders: folderReport.folders.requested,
+                      removed: folderReport.folders.removed,
+                      kept: folderReport.folders.keptOut,
+                      bytes: formatBytes(folderReport.bytes.removed),
+                      outBytes: formatBytes(folderReport.bytes.outKept),
+                    })),
+                    (folderReport.errors || []).length > 0
+                      ? h('div', null,
+                          h('h4', { style: STYLE.cardTitle }, t('folderErrors')),
+                          folderReport.errors.map((error, index) => h('div', { key: index, style: STYLE.error }, `${error.id} — ${error.message}`)),
+                        )
+                      : null,
+                    (folderReport.warnings || []).length > 0
+                      ? h('div', null,
+                          folderReport.warnings.map((warning, index) => h('div', { key: index, style: STYLE.warn }, warning)),
+                        )
+                      : null,
+                  )
+                : null,
+            ),
+          ),
 
           report !== null
             ? h(

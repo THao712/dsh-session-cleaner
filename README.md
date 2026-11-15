@@ -37,14 +37,18 @@ A DeepSeek Harness plugin that previews and permanently deletes archived Session
 
 ## 安装
 
+从 GitHub 安装（当前为 GitHub-only 分发，不依赖 npm）：
+
 ```text
-git clone https://github.com/THao712/dsh-session-cleaner.git
+dsh plugin --profile <profile> add github:THao712/dsh-session-cleaner
 ```
 
-然后在 Harness 中把**本地仓库绝对路径**作为 bundle 安装（插件包名是 `@local/session-cleaner`）：
+包名是 `dsh-session-cleaner-thao712`。Desktop 用户也可以通过 dsh-market 的插件页安装。
+
+本地开发时，把**本地仓库绝对路径**作为 bundle 安装：
 
 ```text
-plugin_manager install_bundle  target: <克隆目录的绝对路径>
+plugin_manager install_bundle  target: <仓库绝对路径>
 ```
 
 安装完成后刷新页面，打开 **设置 → 会话清理**。刷新是为了载入新的 Client bundle；Host 路由只接受当前已登录的 Harness 页面请求。
@@ -61,7 +65,7 @@ plugin_manager install_bundle  target: <克隆目录的绝对路径>
 
 ## 接口与实现
 
-- Host：`@local/session-cleaner` 的 `index.js`，注册 `POST /dsh-session-cleaner/api`，使用 `connection.requestRejection()` 做 Host/Origin 围栏与登录态校验。
+- Host：`dsh-session-cleaner-thao712` 的 `index.js`，注册 `POST /dsh-session-cleaner/api`，使用 `connection.requestRejection()` 做 Host/Origin 围栏与登录态校验。
 - Client：`client.js` 注册 `settings.section`（id `session-cleaner`）。
 - `preview` 返回短期 `previewToken`；`delete` 必须携带该 token，并重新推导候选、比较指纹，避免执行用户没看过的预览。
 - 对话目录：`folders` 返回目录清单与 `previewToken`；`folders-delete` 必须携带 token，并重新扫描、比较目录大小/修改时间/状态指纹。删除前再次校验目录位于 `conversations/` 直接子目录、不是 symlink/Junction、元数据匹配（有 `session.json` 时），并拒绝仍被 Host 加载的目录。

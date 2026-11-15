@@ -7,7 +7,7 @@
  * ids, menu choices, and a confirmation flag, never an authoritative path.
  */
 window.__ModuleLoader__.load({
-  id: '@local/session-cleaner',
+  id: 'dsh-session-cleaner-thao712',
   factory(require) {
     const React = require('react')
     const h = React.createElement

@@ -48,6 +48,9 @@ async function makeHarness(options = {}) {
     async attachSession(sessionId) { this.attached.push(sessionId) },
   }
   const archived = new Set([id])
+  if (Array.isArray(options.pendingIds) && options.pendingIds.length > 0) {
+    await writeFile(join(home, 'session-cleaner-pending.json'), JSON.stringify(options.pendingIds))
+  }
   let route
   const ctx = {
     effect(fn) { return fn() },
@@ -161,7 +164,7 @@ test('session cleaner safety regressions', async (t) => {
     }
   })
 
-  await t.test('idle open Sessions are blocked until restart', async () => {
+  await t.test('idle open Sessions delete files and defer bookkeeping', async () => {
     const id = nextId()
     const harness = await makeHarness({
       id,
@@ -175,8 +178,34 @@ test('session cleaner safety regressions', async (t) => {
       assert.equal(list.value.sessions[0].open, true)
       const options = { attachments: false, workspaceFiles: false, scanCreated: false, spills: false, conversationFolder: false, imageCache: false }
       const preview = await harness.call('preview', { ids: [id], options })
-      assert.equal(preview.ok, false)
-      assert.equal(preview.error.code, 'session-open')
+      assert.equal(preview.ok, true)
+      assert.equal(preview.value.sessions[0].open, true)
+      const deleted = await harness.call('delete', {
+        ids: [id], options, previewToken: preview.value.previewToken,
+        confirmed: true, files: [], attachments: [],
+      })
+      assert.equal(deleted.ok, true)
+      assert.equal(deleted.value.pending.includes(id), true)
+      assert.equal(harness.archived.has(id), true)
+      assert.deepEqual(harness.workspace.detached, [])
+      await assert.rejects(access(harness.sessionDir), /ENOENT/)
+      const pending = JSON.parse(await readFile(join(harness.home, 'session-cleaner-pending.json'), 'utf8'))
+      assert.deepEqual(pending, [id])
+      const after = await harness.call('list', {})
+      assert.equal(after.value.sessions.some((session) => session.id === id), false)
+    } finally {
+      await harness.cleanup()
+    }
+  })
+
+  await t.test('pending bookkeeping finalizes on the next start', async () => {
+    const id = nextId()
+    const harness = await makeHarness({ id, pendingIds: [id] })
+    try {
+      await new Promise((resolve) => setTimeout(resolve, 100))
+      assert.equal(harness.archived.has(id), false)
+      assert.deepEqual(harness.workspace.detached, [id])
+      await assert.rejects(access(join(harness.home, 'session-cleaner-pending.json')), /ENOENT/)
     } finally {
       await harness.cleanup()
     }
@@ -751,12 +780,14 @@ test('session cleaner safety regressions', async (t) => {
     }
   })
 
-  await t.test('a loaded Session folder is blocked from folder cleanup', async () => {
+  await t.test('a loaded Session folder can still be cleaned without restarting', async () => {
     const workspacePath = join(tmpdir(), `dsh-folder-open-ws-${Date.now()}-${sequence}`)
     const id = nextId()
     const folder = join(workspacePath, 'conversations', 'conversation')
     await mkdir(join(folder, 'work'), { recursive: true })
+    await mkdir(join(folder, 'out'), { recursive: true })
     await writeFile(join(folder, 'work', 'a.py'), 'x')
+    await writeFile(join(folder, 'out', 'final.txt'), 'done')
     await writeFile(join(folder, 'session.json'), JSON.stringify({ sessionId: id, workspace: workspacePath, folder: 'conversation' }))
     const harness = await makeHarness({
       id,
@@ -767,15 +798,16 @@ test('session cleaner safety regressions', async (t) => {
       const list = await harness.call('folders', {})
       const row = list.value.folders.find((entry) => entry.name === 'conversation')
       assert.equal(row.open, true)
-      assert.equal(row.keepOutDeletable, false)
+      assert.equal(row.keepOutDeletable, true)
       const result = await harness.call('folders-delete', {
         previewToken: list.value.previewToken,
         confirmed: true,
         folders: [{ key: row.key, mode: 'keepOut' }],
       })
       assert.equal(result.ok, true)
-      assert.equal(result.value.folders.skipped, 1)
-      await access(join(folder, 'work', 'a.py'))
+      assert.equal(result.value.folders.keptOut, 1)
+      await assert.rejects(access(join(folder, 'work')), /ENOENT/)
+      await access(join(folder, 'out', 'final.txt'))
     } finally {
       await harness.cleanup()
     }

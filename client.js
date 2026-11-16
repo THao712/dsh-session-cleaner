@@ -23,7 +23,7 @@ window.__ModuleLoader__.load({
         title: '会话清理',
         intro: '选择已归档的会话，先预览将被永久删除的全部内容，再确认执行。删除范围包括会话日志、投影检查点、仅被这些会话引用的附件，以及会话在工作区中产生的文件。',
         dangerNote: '永久删除不可撤销。预览会逐项列出将被删除的路径；请确认其中没有你仍需保留的文件。',
-        openNote: '显示“已打开（需重启）”的会话仍被 Harness 加载。请先重启 Harness（归档状态会保留），再回来清理；否则删除后它会以“未分组”残留。',
+        openNote: '显示“已打开”的会话仍被 Harness 加载。文件可以立即删除；工作区与归档记账会在下次启动自动收尾，不会进入“未分组”。',
         loading: '正在读取已归档会话…',
         loadFailed: '无法读取已归档会话：{message}',
         retry: '重试',
@@ -34,7 +34,7 @@ window.__ModuleLoader__.load({
         selected: '已选 {count} 个会话',
         totalSize: '列表合计 {size}',
         live: '运行中',
-        opened: '已打开（需重启）',
+        opened: '已打开',
         missing: '日志缺失',
         untitled: '未命名会话',
         messages: '{count} 条记录',
@@ -102,7 +102,6 @@ window.__ModuleLoader__.load({
         folderErrors: '未完成的目录',
         folderNoSelection: '请选择至少一个目录。',
         folderStale: '目录已变化，已清除选择。请刷新后重试。',
-        folderOpenBlocked: '仍被 Harness 加载，需重启后再清理',
         folderMetadataInvalid: '目录元数据不匹配，不能整目录删除',
         folderKeepHint: '保留 out：删除 work/ 与 AGENTS.md，其他文件不动。',
         warnings: '提示',
@@ -168,6 +167,7 @@ window.__ModuleLoader__.load({
         resultTitle: '清理完成',
         resultSummary: '已处理 {sessions} 个会话，删除日志 {logs} 份、检查点 {projections} 份、会话目录 {folders} 个、附件 {attachments} 个、工作区文件 {files} 个、工具输出临时目录 {spills} 个，共释放 {bytes}。',
         resultSkipped: '因共享引用、工作区边界或安全校验保留：附件 {attachments} 个、工作区文件 {files} 个、临时目录 {spills} 个。',
+        resultPending: '有 {count} 个已打开会话的文件已删除；其工作区/归档记账将在下次启动自动收尾，不会出现在“未分组”。',
         resultConversationSkipped: '有 {count} 个会话目录因仍被其他会话使用或含有未知文件而保留。',
         resultMissing: '其中 {count} 个会话的日志此前已缺失，只清理了归档记录。',
         resultImageCache: '附件请求缓存已清空（{bytes}）。',
@@ -186,7 +186,7 @@ window.__ModuleLoader__.load({
         title: 'Session cleanup',
         intro: 'Pick archived Sessions, preview everything a permanent deletion would remove, then confirm. Deletion covers Session logs, projection checkpoints, attachments referenced only by these Sessions, and files the Sessions produced in their workspace.',
         dangerNote: 'Permanent deletion cannot be undone. The preview lists every path; check that nothing you still need is included.',
-        openNote: 'Sessions marked “Open (restart)” are still loaded by Harness. Restart Harness first (archive state is kept), then clean them up; otherwise they linger under Ungrouped.',
+        openNote: 'Sessions marked “Open” are still loaded by Harness. Their files can be deleted now; workspace and archive bookkeeping is finalized on the next Harness start, without creating Ungrouped ghosts.',
         loading: 'Reading archived Sessions…',
         loadFailed: 'Could not read archived Sessions: {message}',
         retry: 'Retry',
@@ -197,7 +197,7 @@ window.__ModuleLoader__.load({
         selected: '{count} Sessions selected',
         totalSize: '{size} in the list',
         live: 'Live',
-        opened: 'Open (restart)',
+        opened: 'Open',
         missing: 'Log missing',
         untitled: 'Untitled Session',
         messages: '{count} records',
@@ -265,7 +265,6 @@ window.__ModuleLoader__.load({
         folderErrors: 'Folders not completed',
         folderNoSelection: 'Select at least one folder.',
         folderStale: 'The folders changed; the selection was cleared. Refresh and try again.',
-        folderOpenBlocked: 'Still loaded by Harness; restart before cleaning',
         folderMetadataInvalid: 'Folder metadata does not match; whole-folder deletion is blocked',
         folderKeepHint: 'Keep out/: deletes work/ and AGENTS.md; leaves other files untouched.',
         warnings: 'Notes',
@@ -331,6 +330,7 @@ window.__ModuleLoader__.load({
         resultTitle: 'Cleanup complete',
         resultSummary: 'Processed {sessions} Session(s), removed {logs} log(s), {projections} checkpoint(s), {folders} conversation folder(s), {attachments} attachment(s), {files} workspace file(s), and {spills} spill director(ies), freeing {bytes}.',
         resultSkipped: 'Kept by sharing, workspace-boundary, or safety checks: {attachments} attachment(s), {files} workspace file(s), {spills} spill director(ies).',
+        resultPending: '{count} loaded Session(s) had their files removed; their workspace/archive bookkeeping is finalized on the next Harness start without appearing under Ungrouped.',
         resultConversationSkipped: '{count} conversation folder(s) were kept because another Session still uses them or they contain unexpected files.',
         resultMissing: '{count} Session log(s) were already missing; only archive records were cleaned.',
         resultImageCache: 'The attachment request cache was cleared ({bytes}).',
@@ -637,7 +637,7 @@ window.__ModuleLoader__.load({
           { style: { ...STYLE.row, ...(props.last ? STYLE.rowLast : {}) } },
           h(Check, {
             checked: props.checked,
-            disabled: session.live === true || session.open === true,
+            disabled: session.live === true,
             onChange: () => props.onToggle(session.id),
             label: session.title || session.id,
           }),
@@ -784,17 +784,15 @@ window.__ModuleLoader__.load({
                   : t('folderStateUnarchived')
         const reasonText = folder.running
           ? t('folderStateRunning')
-          : folder.open
-            ? t('folderOpenBlocked')
-            : folder.symlink
-              ? t('symlinkAncestor')
-              : folder.referencesUnknown
-                ? t('referencesUnknown')
-                : folder.sharedWith && folder.sharedWith.length > 0
-                  ? t('sharedWith', { count: folder.sharedWith.length })
-                  : folder.metadataState === 'invalid'
-                    ? t('folderMetadataInvalid')
-                    : folder.reason
+          : folder.symlink
+            ? t('symlinkAncestor')
+            : folder.referencesUnknown
+              ? t('referencesUnknown')
+              : folder.sharedWith && folder.sharedWith.length > 0
+                ? t('sharedWith', { count: folder.sharedWith.length })
+                : folder.metadataState === 'invalid'
+                  ? t('folderMetadataInvalid')
+                  : folder.reason
         return h(
           'div',
           { style: { ...STYLE.row, ...(props.last ? STYLE.rowLast : {}) } },
@@ -972,7 +970,7 @@ window.__ModuleLoader__.load({
             setSelected((previous) => {
               const next = new Set()
               for (const id of previous) {
-                if (list.some((session) => session.id === id && session.live !== true && session.open !== true)) next.add(id)
+                if (list.some((session) => session.id === id && session.live !== true)) next.add(id)
               }
               return next
             })
@@ -1071,7 +1069,7 @@ window.__ModuleLoader__.load({
         }
 
         const selectAll = () => {
-          setSelected(new Set(sessions.filter((session) => session.live !== true && session.open !== true).map((session) => session.id)))
+          setSelected(new Set(sessions.filter((session) => session.live !== true).map((session) => session.id)))
           invalidatePreview()
         }
 
@@ -1814,6 +1812,9 @@ window.__ModuleLoader__.load({
                   })(),
                   report.conversation && report.conversation.skipped > 0
                     ? h('p', { style: STYLE.meta }, t('resultConversationSkipped', { count: report.conversation.skipped }))
+                    : null,
+                  Array.isArray(report.pending) && report.pending.length > 0
+                    ? h('p', { style: STYLE.meta }, t('resultPending', { count: report.pending.length }))
                     : null,
                   report.imageCache && report.imageCache.removed ? h('p', { style: STYLE.meta }, t('resultImageCache', { bytes: formatBytes(report.imageCache.bytes) })) : null,
                   (report.errors || []).length > 0

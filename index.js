@@ -60,6 +60,7 @@ const CONVERSATION_BASE = 'conversations'
 const CONVERSATION_METADATA = 'session.json'
 const CONVERSATION_INDEX = 'index.json'
 const CONVERSATION_RULES = 'AGENTS.md'
+const PENDING_FILE = 'session-cleaner-pending.json'
 const KNOWN_FOLDER_ENTRIES = new Set(['work', 'out', CONVERSATION_METADATA, 'AGENTS.md'])
 
 const SKIP_DIRS = new Set([
@@ -770,9 +771,6 @@ async function buildPreview(ctx, ids, options) {
     if (isAgentRunning(ctx, id)) {
       throw new HttpError(409, 'session-live', `Session ${id} is still running; stop it before deleting.`)
     }
-    if (isSessionOpen(ctx, id)) {
-      throw new HttpError(409, 'session-open', `Session ${id} is still loaded in this Host process. Close its conversation or restart Harness, then delete. Archiving stops work but does not unload the Agent.`)
-    }
   }
 
   const snapshots = await ctx.sessionPersistence.list()
@@ -908,6 +906,10 @@ async function buildPreview(ctx, ids, options) {
       }
     }
     sessions.push(base)
+  }
+
+  if (sessions.some((session) => session.open === true && session.live !== true)) {
+    warnings.push('Some selected Sessions are still loaded by Harness. Their files are deleted now; their workspace and archive records are finalized on the next Harness start, without creating “未分组” ghosts.')
   }
 
   const sessionInfo = new Map(sessions.map((session) => [session.id, session]))
@@ -1658,6 +1660,68 @@ function getFolderPreviewToken(token) {
   return record
 }
 
+function pendingPath() {
+  return join(homeDirectory(), PENDING_FILE)
+}
+
+async function readPendingIds() {
+  const value = await readJsonFile(pendingPath(), undefined)
+  if (!Array.isArray(value)) return []
+  return [...new Set(value.filter((id) => typeof id === 'string' && isSafeSessionId(id)))]
+}
+
+async function writePendingIds(ids) {
+  const path = pendingPath()
+  const unique = [...new Set(ids.filter((id) => typeof id === 'string' && isSafeSessionId(id)))]
+  if (unique.length === 0) {
+    try {
+      await unlink(path)
+    } catch (error) {
+      if (!(error && error.code === 'ENOENT')) throw error
+    }
+    return
+  }
+  await writeJsonAtomic(path, unique)
+}
+
+async function addPendingId(id) {
+  const pending = await readPendingIds()
+  if (!pending.includes(id)) pending.push(id)
+  await writePendingIds(pending)
+}
+
+/**
+ * An archived Session that is still resident in `ctx.sessions` cannot have its
+ * workspace slot and archive marker dropped immediately: the sidebar lists the
+ * live Session and would show it under "未分组". Its files can be deleted right
+ * away; the bookkeeping waits for a Host process that no longer owns the
+ * Session. A plugin reload while the old process is still alive therefore
+ * leaves the entry pending.
+ */
+async function finalizePending(ctx) {
+  const pending = await readPendingIds()
+  if (pending.length === 0) return
+  const registry = ctx.workspaceRegistry
+  const workspaces = registry.list()
+  const remaining = []
+  for (const id of pending) {
+    if (isSessionOpen(ctx, id) || isAgentRunning(ctx, id)) {
+      remaining.push(id)
+      continue
+    }
+    try {
+      const workspace = workspaces.find((item) => item.sessionIds.includes(id))
+      if (workspace !== undefined) await workspace.detachSession(id)
+      await registry.unarchiveSession(id)
+      await registry.unpinSession(id)
+    } catch (error) {
+      remaining.push(id)
+      ctx.logger?.warn?.(`session-cleaner: could not finalize pending Session ${id}: ${formatError(error)}`)
+    }
+  }
+  if (remaining.length !== pending.length) await writePendingIds(remaining)
+}
+
 function sendJson(res, status, payload) {
   if (res.headersSent) return
   res.statusCode = status
@@ -1830,7 +1894,10 @@ async function resolveProjectPath(ctx, id) {
 
 async function listArchived(ctx) {
   const registry = ctx.workspaceRegistry
-  const archivedIds = [...registry.archivedSessionIds].filter(isSafeSessionId)
+  const pending = new Set(await readPendingIds())
+  const archivedIds = [...registry.archivedSessionIds]
+    .filter(isSafeSessionId)
+    .filter((id) => !pending.has(id))
   const snapshots = await ctx.sessionPersistence.list()
   const snapshotById = new Map(snapshots.map((snapshot) => [snapshot.header.id, snapshot]))
   const workspaceBySession = new Map()
@@ -1963,9 +2030,9 @@ async function listConversationFolders(ctx) {
       }
       const sharedWith = [...users].filter((id) => id !== sessionId)
       const referencesUnknown = indexed.unreadable
-      const allDeletable = !open && !running && !symlink && metadataState !== 'invalid' &&
+      const allDeletable = !running && !symlink && metadataState !== 'invalid' &&
         sharedWith.length === 0 && !referencesUnknown
-      const keepOutDeletable = !open && !running && !symlink &&
+      const keepOutDeletable = !running && !symlink &&
         sharedWith.length === 0 && !referencesUnknown
       let state = 'unarchived'
       if (running) state = 'running'
@@ -1975,7 +2042,6 @@ async function listConversationFolders(ctx) {
       else if (archived.has(sessionId)) state = 'archived'
       let reason
       if (running) reason = 'The Session is running; stop it first.'
-      else if (open) reason = 'The Session is still loaded; restart Harness after archiving, then clean it up.'
       else if (symlink) reason = 'The folder is reached through a symlink or junction.'
       else if (referencesUnknown) reason = 'A Session log could not be read, so folder sharing cannot be proven safe.'
       else if (sharedWith.length > 0) reason = `Still used by ${sharedWith.length} other Session(s).`
@@ -2136,9 +2202,9 @@ async function executeFolderDeletion(ctx, body, tokenRecord) {
       throw new HttpError(409, 'stale-preview', 'A conversation folder is no longer listed. Refresh and preview again.')
     }
     const mode = item.mode === 'all' ? 'all' : 'keepOut'
-    if (row.open || row.running) {
+    if (row.running) {
       report.folders.skipped += 1
-      report.errors.push({ scope: 'folder', id: row.name, message: row.reason ?? 'The Session is still loaded.' })
+      report.errors.push({ scope: 'folder', id: row.name, message: row.reason ?? 'The Session is running.' })
       continue
     }
     if (mode === 'all' && row.allDeletable !== true) {
@@ -2289,9 +2355,6 @@ async function executeDeletion(ctx, body, tokenRecord) {
     if (isAgentRunning(ctx, session.id)) {
       throw new HttpError(409, 'session-live', `Session ${session.id} is still running; stop it before deleting.`)
     }
-    if (isSessionOpen(ctx, session.id)) {
-      throw new HttpError(409, 'session-open', `Session ${session.id} is still loaded in this Host process. Close its conversation or restart Harness, then delete.`)
-    }
   }
   const selectedIds = new Set(preview.sessions.map((session) => session.id))
 
@@ -2327,6 +2390,7 @@ async function executeDeletion(ctx, body, tokenRecord) {
     files: { removed: 0, bytes: 0, skipped: 0 },
     spills: { removed: 0, bytes: 0, skipped: 0 },
     imageCache: { removed: false, bytes: 0 },
+    pending: [],
     errors: [],
     warnings: [...preview.warnings],
   }
@@ -2347,11 +2411,7 @@ async function executeDeletion(ctx, body, tokenRecord) {
       report.errors.push({ scope: 'session-live', id, message: 'The Session started running; its files and log were kept.' })
       continue
     }
-    if (isSessionOpen(ctx, id)) {
-      failedSessions.add(id)
-      report.errors.push({ scope: 'session-open', id, message: 'The Session is still loaded; close it or restart Harness, then delete.' })
-      continue
-    }
+    const wasOpen = isSessionOpen(ctx, id)
 
     if (options.conversationFolder === true && session.conversationFolder !== null) {
       if (session.conversationFolder.deletable !== true) {
@@ -2386,11 +2446,6 @@ async function executeDeletion(ctx, body, tokenRecord) {
         report.errors.push({ scope: 'session-live', id, message: 'The Session started running before its log deletion; its log was kept.' })
         continue
       }
-      if (isSessionOpen(ctx, id)) {
-        failedSessions.add(id)
-        report.errors.push({ scope: 'session-open', id, message: 'The Session is still loaded before its log deletion; close it or restart Harness.' })
-        continue
-      }
       try {
         const directory = await resolveSessionDirectory(persistenceRoot(ctx), {
           cwd: session.cwd,
@@ -2418,6 +2473,22 @@ async function executeDeletion(ctx, body, tokenRecord) {
 
     if (!logRemoved) continue
     report.sessions.removed += 1
+
+    /* A loaded Session cannot lose its workspace/archive bookkeeping yet: the
+       sidebar would list it with no workspace and show “未分组”. Its files are
+       gone, so keep the archive marker and defer only the bookkeeping. */
+    if (wasOpen || isSessionOpen(ctx, id)) {
+      try {
+        await addPendingId(id)
+        report.pending.push(id)
+        report.warnings.push(`Session ${id}: files were removed now; its workspace and archive records will be finalized on the next Harness start.`)
+      } catch (error) {
+        report.errors.push({ scope: 'pending', id, message: formatError(error) })
+        report.warnings.push(`Session ${id}: its files were removed, but the deferred bookkeeping record could not be written; it remains archived.`)
+      }
+      factCache.delete(id)
+      continue
+    }
 
     /* Registry state is changed only after the filesystem work succeeds. This
        keeps a failed deletion archived at its original workspace position and
@@ -2643,5 +2714,9 @@ export function apply(ctx) {
     path: ROUTE_PATH,
     handler,
   }), `session-cleaner: POST ${ROUTE_PATH}`)
+
+  void finalizePending(ctx).catch((error) => {
+    ctx.logger?.warn?.(`session-cleaner: pending finalization failed: ${formatError(error)}`)
+  })
 }
 

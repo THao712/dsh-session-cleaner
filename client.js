@@ -39,6 +39,8 @@ window.__ModuleLoader__.load({
         sortSize: '按大小',
         sortTimeHint: '按会话创建时间从新到旧排列。',
         sortSizeHint: '按会话日志大小从大到小排列；日志缺失或大小未知的会话排在最后。',
+        searchPlaceholder: '搜索标题、ID 或工作区',
+        noMatchingSessions: '没有匹配的会话。',
         live: '运行中',
         opened: '已打开',
         missing: '日志缺失',
@@ -233,6 +235,8 @@ window.__ModuleLoader__.load({
         sortSize: 'Largest',
         sortTimeHint: 'Newest Sessions first.',
         sortSizeHint: 'Largest Session logs first; missing or unknown sizes go last.',
+        searchPlaceholder: 'Search title, id, or workspace',
+        noMatchingSessions: 'No matching Session.',
         live: 'Live',
         opened: 'Open',
         missing: 'Log missing',
@@ -949,6 +953,7 @@ window.__ModuleLoader__.load({
         const [phase, setPhase] = useState('loading')
         const [sessions, setSessions] = useState([])
         const [sortMode, setSortMode] = useState('size')
+        const [search, setSearch] = useState('')
         const [selectionNotice, setSelectionNotice] = useState(null)
         const [lastRun, setLastRun] = useState(null)
         const [selected, setSelected] = useState(() => new Set())
@@ -1159,7 +1164,7 @@ window.__ModuleLoader__.load({
         }
 
         const selectAll = () => {
-          const selectable = sortedSessions.filter((session) => session.live !== true)
+          const selectable = visibleSessions.filter((session) => session.live !== true)
           const limited = selectable.slice(0, MAX_SESSIONS)
           setSelected(new Set(limited.map((session) => session.id)))
           setSelectionNotice(selectable.length > MAX_SESSIONS
@@ -1419,6 +1424,19 @@ window.__ModuleLoader__.load({
           })
           return list
         }, [sessions, sortMode])
+        const visibleSessions = useMemo(() => {
+          const query = search.trim().toLowerCase()
+          if (query.length === 0) return sortedSessions
+          return sortedSessions.filter((session) => {
+            const fields = [
+              session.title,
+              session.id,
+              session.workspace?.title,
+              session.workspace?.path,
+            ]
+            return fields.some((field) => typeof field === 'string' && field.toLowerCase().includes(query))
+          })
+        }, [sortedSessions, search])
         const displayFiles = preview === null
           ? []
           : showAllFiles
@@ -1485,10 +1503,18 @@ window.__ModuleLoader__.load({
             h(
               'div',
               { style: STYLE.cardHead },
-              h('h3', { style: STYLE.cardTitle }, `${t('sessionsSection')} · ${sessions.length}`),
+              h('h3', { style: STYLE.cardTitle }, `${t('sessionsSection')} · ${visibleSessions.length === sessions.length ? sessions.length : `${visibleSessions.length}/${sessions.length}`}`),
               h(
                 'div',
                 { style: STYLE.inline },
+                h('input', {
+                  type: 'search',
+                  value: search,
+                  placeholder: t('searchPlaceholder'),
+                  'aria-label': t('searchPlaceholder'),
+                  onChange: (event) => setSearch(event.target.value),
+                  style: { ...STYLE.input, width: 190 },
+                }),
                 h('span', { style: STYLE.meta }, t('sortLabel')),
                 h(
                   'button',
@@ -1529,22 +1555,24 @@ window.__ModuleLoader__.load({
                     )
                   : sessions.length === 0
                     ? h('div', { style: STYLE.empty }, t('empty'))
-                    : h(
-                        'div',
-                        { style: STYLE.list },
-                        sortedSessions.map((session, index) =>
-                          h(SessionRow, {
-                            key: session.id,
-                            session,
-                            checked: selected.has(session.id),
-                            onToggle: toggleSession,
-                            onOpen: openWorkspace,
-                            opening: openingId === session.id,
-                            error: openError && openError.id === session.id ? openError.message : null,
-                            last: index === sortedSessions.length - 1,
-                          }),
+                    : visibleSessions.length === 0
+                      ? h('div', { style: STYLE.empty }, t('noMatchingSessions'))
+                      : h(
+                          'div',
+                          { style: STYLE.list },
+                          visibleSessions.map((session, index) =>
+                            h(SessionRow, {
+                              key: session.id,
+                              session,
+                              checked: selected.has(session.id),
+                              onToggle: toggleSession,
+                              onOpen: openWorkspace,
+                              opening: openingId === session.id,
+                              error: openError && openError.id === session.id ? openError.message : null,
+                              last: index === visibleSessions.length - 1,
+                            }),
+                          ),
                         ),
-                      ),
             ),
           ),
 

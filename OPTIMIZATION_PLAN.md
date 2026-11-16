@@ -26,7 +26,7 @@
 - 第 3 节：token 执行前占用并区分 `preview-in-use` / `preview-consumed`；会话清理与目录清理共用写队列；pending 与 `conversations/index.json` 更新串行化并合并并发条目。
 - 第 4 节：文件创建时间增加会话结束上界；默认只勾选 `write` / `str_replace_editor` 且能证明会话期间新建的文件；预览显示时间证据。
 - 第 5 节：预览绑定文件身份、会话 revision、日志/目录递归清单摘要、检查点大小、选项与候选；文件改写、日志变化、目录新增/深层变化会使 token 失效；执行前再次核对关键属性。
-- 第 6 节：新增 `<DSH_HOME>/session-cleaner-journal.json`，在首个不可逆操作前写入，记录任务 ID、已确认范围、预览摘要、阶段、已处理/失败/待收尾会话和最终报告；崩溃后标记 `interrupted` 并在 UI 显示，不自动重放。detach / unarchive / unpin 失败也写入 pending，下次启动重试。
+- 第 6 节：新增 `<DSH_HOME>/session-cleaner-journal.json`，在首个不可逆操作前写入，记录任务 ID、已确认范围、预览摘要、阶段、已处理/失败/待收尾会话和最终报告；崩溃后标记 `interrupted` 并在 UI 显示。启动时只对 journal 中已完成日志删除的会话恢复 detach/unarchive/unpin 记账；不会自动重放文件/附件/目录删除。detach / unarchive / unpin 失败也写入 pending，下次启动重试。
 - 第 7 节（部分）：目录统计与递归清单合并为一次遍历；目录扫描超限/权限失败显式标记为不完整并阻止整目录删除；会话日志大小区分完整/下界。
 - 第 8 节（部分）：单次选择上限 200 并有提示；预览容量随勾选实时汇总；两个清理入口执行期间互相禁用；目录 token 按选中目录和模式校验；中断/部分完成 journal 提示。
 

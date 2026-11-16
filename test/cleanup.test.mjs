@@ -15,6 +15,7 @@ function nextId() {
 async function makeHarness(options = {}) {
   const root = await mkdtemp(join(tmpdir(), 'dsh-session-cleaner-test-'))
   const home = join(root, 'dsh-home')
+  await mkdir(home, { recursive: true })
   process.env.DSH_HOME = home
   process.env.DSH_PROFILE_DIR = join(root, 'profile')
   const workspacePath = options.workspacePath ?? join(root, 'workspace')
@@ -27,11 +28,14 @@ async function makeHarness(options = {}) {
   const liveById = new Map(options.live ?? [])
   const openErrorIds = new Set(options.openErrorIds ?? [])
   const sessionIds = options.sessionIds ?? [id]
+  const skipSessionDirs = new Set(options.skipSessionDirs ?? [])
   const sessionDirs = new Map()
   for (const sessionId of sessionIds) {
     const directory = join(home, 'sessions', '--test--', sessionId)
-    await mkdir(directory, { recursive: true })
-    await writeFile(join(directory, 'session.v4.jsonl.zstd'), 'test')
+    if (!skipSessionDirs.has(sessionId)) {
+      await mkdir(directory, { recursive: true })
+      await writeFile(join(directory, 'session.v4.jsonl.zstd'), 'test')
+    }
     sessionDirs.set(sessionId, directory)
   }
   const sessionDir = sessionDirs.get(id)
@@ -734,6 +738,38 @@ test('session cleaner safety regressions', async (t) => {
       assert.equal(journal.value.journal.status, 'interrupted')
       assert.equal(journal.value.journal.phase, 'bookkeeping')
       assert.equal(typeof journal.value.journal.interruptedAt, 'number')
+    } finally {
+      await harness.cleanup()
+    }
+  })
+
+  await t.test('interrupted journal recovers bookkeeping for a removed log', async () => {
+    const id = nextId()
+    const harness = await makeHarness({
+      id,
+      skipSessionDirs: [id],
+      journal: {
+        version: 1,
+        id: 'recover-task',
+        createdAt: Date.now() - 1000,
+        updatedAt: Date.now() - 1000,
+        status: 'running',
+        phase: 'bookkeeping',
+        ids: [id],
+        options: {},
+        completedSessions: [id],
+        failedSessions: [],
+        pending: [],
+        summary: null,
+        errors: [],
+        warnings: [],
+      },
+    })
+    try {
+      await new Promise((resolve) => setTimeout(resolve, 200))
+      assert.equal(harness.archived.has(id), false)
+      assert.ok(harness.workspace.detached.includes(id))
+      assert.equal(await access(join(harness.home, 'session-cleaner-pending.json')).then(() => true, () => false), false)
     } finally {
       await harness.cleanup()
     }

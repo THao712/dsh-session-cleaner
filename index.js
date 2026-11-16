@@ -2078,6 +2078,76 @@ async function markInterruptedJournal(ctx) {
 }
 
 /**
+ * If a process died after a log was removed but before its workspace/archive
+ * bookkeeping was written, the journal can still name that Session. Recover
+ * only the bookkeeping; it never deletes files or artifacts from a journal.
+ * A log that exists again is treated as a new/restored Session and is skipped.
+ */
+async function recoverJournalBookkeeping(ctx) {
+  let record
+  try {
+    record = await readJournalRecord()
+  } catch (error) {
+    ctx.logger?.warn?.(`session-cleaner: cannot inspect interrupted journal: ${formatError(error)}`)
+    return
+  }
+  if (record === undefined || record.status !== 'interrupted' || !Array.isArray(record.completedSessions)) return
+  let snapshots
+  try {
+    snapshots = await ctx.sessionPersistence.list()
+  } catch (error) {
+    ctx.logger?.warn?.(`session-cleaner: cannot recover journal bookkeeping because Session logs are unreadable: ${formatError(error)}`)
+    return
+  }
+  const snapshotById = new Map(snapshots.map((snapshot) => [snapshot.header.id, snapshot]))
+  const registry = ctx.workspaceRegistry
+  const archived = new Set(registry.archivedSessionIds)
+  let pending
+  try {
+    pending = new Set(await readPendingIds())
+  } catch (error) {
+    ctx.logger?.warn?.(`session-cleaner: cannot recover journal bookkeeping because pending state is unreadable: ${formatError(error)}`)
+    return
+  }
+  const root = persistenceRoot(ctx)
+  for (const id of record.completedSessions) {
+    if (!isSafeSessionId(id) || !archived.has(id) || pending.has(id)) continue
+    if (isSessionOpen(ctx, id) || isAgentRunning(ctx, id)) {
+      try {
+        await addPendingId(id)
+        pending.add(id)
+      } catch (error) {
+        ctx.logger?.warn?.(`session-cleaner: cannot queue recovered Session ${id}: ${formatError(error)}`)
+      }
+      continue
+    }
+    const snapshot = snapshotById.get(id)
+    if (snapshot !== undefined) {
+      try {
+        const directory = await resolveSessionDirectory(root, snapshot.header, id)
+        if (directory !== undefined) continue
+      } catch {
+        continue
+      }
+    }
+    try {
+      const workspace = registry.list().find((item) => item.sessionIds.includes(id))
+      if (workspace !== undefined) await workspace.detachSession(id)
+      await registry.unarchiveSession(id)
+      await registry.unpinSession(id)
+      ctx.logger?.warn?.(`session-cleaner: recovered deferred bookkeeping for Session ${id}.`)
+    } catch (error) {
+      ctx.logger?.warn?.(`session-cleaner: could not recover bookkeeping for Session ${id}: ${formatError(error)}`)
+      try {
+        await addPendingId(id)
+      } catch {
+        /* the next startup will retry the journal record */
+      }
+    }
+  }
+}
+
+/**
  * An archived Session that is still resident in `ctx.sessions` cannot have its
  * workspace slot and archive marker dropped immediately: the sidebar lists the
  * live Session and would show it under "未分组". Its files can be deleted right
@@ -3409,11 +3479,12 @@ export function apply(ctx) {
     handler,
   }), `session-cleaner: POST ${ROUTE_PATH}`)
 
-  void finalizePending(ctx).catch((error) => {
-    ctx.logger?.warn?.(`session-cleaner: pending finalization failed: ${formatError(error)}`)
-  })
-  void markInterruptedJournal(ctx).catch((error) => {
-    ctx.logger?.warn?.(`session-cleaner: interrupted journal check failed: ${formatError(error)}`)
+  void (async () => {
+    await markInterruptedJournal(ctx)
+    await finalizePending(ctx)
+    await recoverJournalBookkeeping(ctx)
+  })().catch((error) => {
+    ctx.logger?.warn?.(`session-cleaner: startup recovery failed: ${formatError(error)}`)
   })
 }
 

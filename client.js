@@ -158,6 +158,8 @@ window.__ModuleLoader__.load({
         lastRunInfo: '任务 {id} · 已处理 {completed}/{total} 个会话 · 失败 {failed} · 待收尾 {pending}',
         lastRunPhase: '最后阶段：{phase}',
         lastRunHint: '插件不会自动重放中断的删除。请重新勾选并预览；已经删除的资源会显示为缺失或跳过。',
+        lastRunRepreview: '重新预览剩余会话',
+        lastRunNothing: '没有剩余会话需要重新预览。',
         lastRunDismiss: '隐藏',
         phaseLogs: '会话日志',
         phaseBookkeeping: '归档记账',
@@ -354,6 +356,8 @@ window.__ModuleLoader__.load({
         lastRunInfo: 'Task {id} · {completed}/{total} Sessions processed · {failed} failed · {pending} deferred',
         lastRunPhase: 'Last phase: {phase}',
         lastRunHint: 'The plugin does not automatically replay an interrupted deletion. Select and preview again; resources that were already removed will appear as missing or skipped.',
+        lastRunRepreview: 'Preview remaining Sessions',
+        lastRunNothing: 'No remaining Sessions to preview.',
         lastRunDismiss: 'Dismiss',
         phaseLogs: 'Session logs',
         phaseBookkeeping: 'Archive bookkeeping',
@@ -1184,9 +1188,9 @@ window.__ModuleLoader__.load({
           invalidatePreview()
         }
 
-        const previewNow = async () => {
-          if (selected.size === 0 || deleting || folderDeleting) return
-          if (selected.size > MAX_SESSIONS) {
+        const previewWith = async (ids, requestedOptions) => {
+          if (ids.length === 0 || deleting || folderDeleting) return
+          if (ids.length > MAX_SESSIONS) {
             setPreviewError(t('maxSessions', { max: MAX_SESSIONS }))
             return
           }
@@ -1200,7 +1204,7 @@ window.__ModuleLoader__.load({
           setReport(null)
           setConfirming(false)
           try {
-            const value = await callApi('preview', { ids: [...selected], options }, {
+            const value = await callApi('preview', { ids, options: requestedOptions }, {
               signal: controller.signal,
               timeoutMs: 600000,
             })
@@ -1225,6 +1229,32 @@ window.__ModuleLoader__.load({
             if (seq === requestSeq.current) setPreviewing(false)
             if (previewAbort.current === controller) previewAbort.current = null
           }
+        }
+
+        const previewNow = () => previewWith([...selected], options)
+
+        const resumeLastRun = async () => {
+          if (lastRun === null) return
+          const completed = new Set(lastRun.completedSessions || [])
+          const ids = [...new Set((lastRun.ids || []).filter((id) => typeof id === 'string' && !completed.has(id)))]
+          if (ids.length === 0) {
+            setSelectionNotice(t('lastRunNothing'))
+            return
+          }
+          const resumedOptions = {
+            conversationFolder: false,
+            allowUnknownFolderEntries: false,
+            attachments: true,
+            workspaceFiles: true,
+            scanCreated: true,
+            spills: true,
+            imageCache: false,
+            ...(lastRun.options || {}),
+          }
+          setSelected(new Set(ids))
+          setOptions(resumedOptions)
+          setSelectionNotice(null)
+          await previewWith(ids, resumedOptions)
         }
 
         const requestDelete = () => {
@@ -1478,7 +1508,17 @@ window.__ModuleLoader__.load({
                   'div',
                   { style: STYLE.cardHead },
                   h('h3', { style: STYLE.cardTitle }, t('lastRunTitle')),
-                  h('button', { type: 'button', style: STYLE.button, onClick: () => setLastRun(null) }, t('lastRunDismiss')),
+                  h(
+                    'div',
+                    { style: STYLE.inline },
+                    h('button', {
+                      type: 'button',
+                      style: { ...STYLE.button, ...(previewing || deleting || folderDeleting ? STYLE.disabled : {}) },
+                      disabled: previewing || deleting || folderDeleting,
+                      onClick: resumeLastRun,
+                    }, t('lastRunRepreview')),
+                    h('button', { type: 'button', style: STYLE.button, onClick: () => setLastRun(null) }, t('lastRunDismiss')),
+                  ),
                 ),
                 h(
                   'div',

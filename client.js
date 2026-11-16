@@ -148,6 +148,18 @@ window.__ModuleLoader__.load({
         selectAllLimit: '单次最多 {max} 个会话，已选择前 {count} 个。',
         maxSessions: '单次最多选择 {max} 个会话。',
         busyNote: '另一个清理任务正在执行，请等待完成。',
+        lastRunTitle: '上次清理任务',
+        lastRunInterrupted: '上次清理在完成前中断',
+        lastRunPartial: '上次清理部分完成',
+        lastRunInfo: '任务 {id} · 已处理 {completed}/{total} 个会话 · 失败 {failed} · 待收尾 {pending}',
+        lastRunPhase: '最后阶段：{phase}',
+        lastRunHint: '插件不会自动重放中断的删除。请重新勾选并预览；已经删除的资源会显示为缺失或跳过。',
+        lastRunDismiss: '隐藏',
+        phaseLogs: '会话日志',
+        phaseBookkeeping: '归档记账',
+        phaseArtifacts: '附件/文件',
+        phaseDone: '已完成',
+        phaseUnknown: '未知',
         originWrite: '写入',
         originEdit: '编辑',
         originReplace: '替换编辑',
@@ -328,6 +340,18 @@ window.__ModuleLoader__.load({
         selectAllLimit: 'At most {max} Sessions can be selected; the first {count} were selected.',
         maxSessions: 'Select at most {max} Sessions.',
         busyNote: 'Another cleanup task is running; wait for it to finish.',
+        lastRunTitle: 'Previous cleanup task',
+        lastRunInterrupted: 'The previous cleanup was interrupted',
+        lastRunPartial: 'The previous cleanup partially completed',
+        lastRunInfo: 'Task {id} · {completed}/{total} Sessions processed · {failed} failed · {pending} deferred',
+        lastRunPhase: 'Last phase: {phase}',
+        lastRunHint: 'The plugin does not automatically replay an interrupted deletion. Select and preview again; resources that were already removed will appear as missing or skipped.',
+        lastRunDismiss: 'Dismiss',
+        phaseLogs: 'Session logs',
+        phaseBookkeeping: 'Archive bookkeeping',
+        phaseArtifacts: 'Attachments/files',
+        phaseDone: 'Done',
+        phaseUnknown: 'Unknown',
         originWrite: 'write',
         originEdit: 'edit',
         originReplace: 'replace-edit',
@@ -922,6 +946,7 @@ window.__ModuleLoader__.load({
         const [sessions, setSessions] = useState([])
         const [sortMode, setSortMode] = useState('size')
         const [selectionNotice, setSelectionNotice] = useState(null)
+        const [lastRun, setLastRun] = useState(null)
         const [selected, setSelected] = useState(() => new Set())
         const [options, setOptions] = useState({
           conversationFolder: false,
@@ -991,6 +1016,15 @@ window.__ModuleLoader__.load({
           }
         }, [])
 
+        const loadJournal = useCallback(async () => {
+          try {
+            const value = await callApi('journal', {}, { timeoutMs: 30000 })
+            setLastRun(value && value.journal ? value.journal : null)
+          } catch {
+            setLastRun(null)
+          }
+        }, [])
+
         const load = useCallback(async () => {
           const seq = ++requestSeq.current
           previewAbort.current?.abort()
@@ -1036,12 +1070,13 @@ window.__ModuleLoader__.load({
         useEffect(() => {
           load()
           loadFolders()
+          loadJournal()
           return () => {
             loadAbort.current?.abort()
             previewAbort.current?.abort()
             folderSeq.current += 1
           }
-        }, [load, loadFolders])
+        }, [load, loadFolders, loadJournal])
 
         const openWorkspace = async (session) => {
           setOpeningId(session.id)
@@ -1217,6 +1252,7 @@ window.__ModuleLoader__.load({
             }
             await load()
             await loadFolders()
+            await loadJournal()
           } catch (error) {
             const message = messageOf(error)
             if (error && ['stale-preview', 'preview-required', 'preview-consumed', 'preview-in-use'].includes(error.code)) {
@@ -1386,6 +1422,20 @@ window.__ModuleLoader__.load({
             ? preview.files || []
             : (preview.files || []).slice(0, FILE_PAGE)
         const canDelete = preview !== null && previewToken !== null && selected.size > 0 && !deleting && !folderDeleting
+        const lastRunPhase = lastRun === null
+          ? ''
+          : lastRun.phase === 'logs'
+            ? t('phaseLogs')
+            : lastRun.phase === 'bookkeeping'
+              ? t('phaseBookkeeping')
+              : lastRun.phase === 'artifacts'
+                ? t('phaseArtifacts')
+                : lastRun.phase === 'done'
+                  ? t('phaseDone')
+                  : t('phaseUnknown')
+        const lastRunLabel = lastRun !== null && lastRun.status === 'interrupted'
+          ? t('lastRunInterrupted')
+          : t('lastRunPartial')
 
         return h(
           'div',
@@ -1398,6 +1448,33 @@ window.__ModuleLoader__.load({
             h('p', { style: STYLE.note }, t('dangerNote')),
             h('p', { style: STYLE.meta }, t('openNote')),
           ),
+
+          lastRun !== null && (lastRun.status === 'interrupted' || lastRun.status === 'partial')
+            ? h(
+                'section',
+                { style: { ...STYLE.card, borderColor: 'var(--dsw-alias-state-warn-primary)' } },
+                h(
+                  'div',
+                  { style: STYLE.cardHead },
+                  h('h3', { style: STYLE.cardTitle }, t('lastRunTitle')),
+                  h('button', { type: 'button', style: STYLE.button, onClick: () => setLastRun(null) }, t('lastRunDismiss')),
+                ),
+                h(
+                  'div',
+                  { style: STYLE.cardBody },
+                  h('p', { style: STYLE.warn }, lastRunLabel),
+                  h('p', { style: STYLE.meta }, t('lastRunInfo', {
+                    id: lastRun.id ?? '—',
+                    completed: (lastRun.completedSessions || []).length,
+                    total: (lastRun.ids || []).length,
+                    failed: (lastRun.failedSessions || []).length,
+                    pending: (lastRun.pending || []).length,
+                  })),
+                  h('p', { style: STYLE.meta }, t('lastRunPhase', { phase: lastRunPhase })),
+                  lastRun.status === 'interrupted' ? h('p', { style: STYLE.meta }, t('lastRunHint')) : null,
+                ),
+              )
+            : null,
 
           h(
             'section',

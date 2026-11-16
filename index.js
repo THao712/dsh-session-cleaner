@@ -63,6 +63,8 @@ const CONVERSATION_METADATA = 'session.json'
 const CONVERSATION_INDEX = 'index.json'
 const CONVERSATION_RULES = 'AGENTS.md'
 const PENDING_FILE = 'session-cleaner-pending.json'
+const JOURNAL_FILE = 'session-cleaner-journal.json'
+const JOURNAL_VERSION = 1
 const KNOWN_FOLDER_ENTRIES = new Set(['work', 'out', CONVERSATION_METADATA, 'AGENTS.md'])
 
 const SKIP_DIRS = new Set([
@@ -2033,6 +2035,48 @@ function withPendingLock(task) {
   return run
 }
 
+function journalPath() {
+  return join(homeDirectory(), JOURNAL_FILE)
+}
+
+async function readJournalRecord() {
+  const result = await readJsonFileDetailed(journalPath())
+  if (result.missing === true) return undefined
+  if (result.error !== undefined) {
+    throw new Error(`cannot read ${journalPath()}: ${describeFsError(result.error)}`)
+  }
+  const value = result.value
+  if (value === null || typeof value !== 'object' || Array.isArray(value)) {
+    return { version: JOURNAL_VERSION, status: 'invalid', phase: 'unknown', updatedAt: 0 }
+  }
+  return value
+}
+
+let journalQueue = Promise.resolve()
+
+function withJournalLock(task) {
+  const run = journalQueue.then(() => task(), () => task())
+  journalQueue = run.then(() => undefined, () => undefined)
+  return run
+}
+
+async function persistJournal(record) {
+  record.updatedAt = Date.now()
+  return withJournalLock(() => writeJsonAtomic(journalPath(), record))
+}
+
+async function markInterruptedJournal(ctx) {
+  return withJournalLock(async () => {
+    const record = await readJournalRecord()
+    if (record === undefined || record.status !== 'running') return
+    record.status = 'interrupted'
+    record.interruptedAt = Date.now()
+    record.updatedAt = record.interruptedAt
+    await writeJsonAtomic(journalPath(), record)
+    ctx.logger?.warn?.(`session-cleaner: previous cleanup task ${record.id ?? 'unknown'} was interrupted; its journal is available for inspection.`)
+  })
+}
+
 /**
  * An archived Session that is still resident in `ctx.sessions` cannot have its
  * workspace slot and archive marker dropped immediately: the sidebar lists the
@@ -2936,6 +2980,35 @@ async function executeDeletion(ctx, body, tokenRecord) {
   }
   const failedSessions = new Set()
   const removedSessions = []
+  const journal = {
+    version: JOURNAL_VERSION,
+    id: randomBytes(8).toString('hex'),
+    createdAt: Date.now(),
+    updatedAt: Date.now(),
+    status: 'running',
+    phase: 'logs',
+    ids: preview.sessions.map((session) => session.id),
+    options,
+    fingerprintHash: createHash('sha256').update(tokenRecord.fingerprint).digest('hex'),
+    completedSessions: [],
+    failedSessions: [],
+    pending: [],
+    summary: null,
+    errors: [],
+    warnings: [],
+  }
+  try {
+    await persistJournal(journal)
+  } catch (error) {
+    throw new HttpError(500, 'journal-write-failed', `Cannot write the cleanup journal before deletion: ${formatError(error)}`)
+  }
+  const saveProgress = async () => {
+    try {
+      await persistJournal(journal)
+    } catch (error) {
+      report.warnings.push(`Cleanup journal progress could not be saved (${formatError(error)}); the cleanup itself continues.`)
+    }
+  }
   tokenRecord.started = true
 
   /* Remove irreversible Session data first. Conversation folders are handled
@@ -2948,7 +3021,9 @@ async function executeDeletion(ctx, body, tokenRecord) {
 
     if (isAgentRunning(ctx, id)) {
       failedSessions.add(id)
+      journal.failedSessions.push(id)
       report.errors.push({ scope: 'session-live', id, message: 'The Session started running; its files and log were kept.' })
+      await saveProgress()
       continue
     }
     const wasOpen = isSessionOpen(ctx, id)
@@ -2968,7 +3043,9 @@ async function executeDeletion(ctx, body, tokenRecord) {
     } else {
       if (isAgentRunning(ctx, id)) {
         failedSessions.add(id)
+        journal.failedSessions.push(id)
         report.errors.push({ scope: 'session-live', id, message: 'The Session started running before its log deletion; its log was kept.' })
+        await saveProgress()
         continue
       }
       try {
@@ -2991,14 +3068,18 @@ async function executeDeletion(ctx, body, tokenRecord) {
         }
       } catch (error) {
         failedSessions.add(id)
+        journal.failedSessions.push(id)
         report.errors.push({ scope: 'session-log', id, message: formatError(error) })
+        await saveProgress()
         continue
       }
     }
 
     if (!logRemoved) continue
     report.sessions.removed += 1
+    journal.completedSessions.push(id)
     removedSessions.push({ session, wasOpen, workspace })
+    await saveProgress()
   }
 
   const pendingReported = new Set()
@@ -3009,6 +3090,7 @@ async function executeDeletion(ctx, body, tokenRecord) {
         pendingReported.add(id)
         report.pending.push(id)
         report.sessions.deferred += 1
+        if (!journal.pending.includes(id)) journal.pending.push(id)
       }
       report.warnings.push(warning)
       return true
@@ -3019,6 +3101,8 @@ async function executeDeletion(ctx, body, tokenRecord) {
     }
   }
 
+  journal.phase = 'bookkeeping'
+  await saveProgress()
   for (const { session, wasOpen, workspace } of removedSessions) {
     const id = session.id
     const folder = session.conversationFolder
@@ -3049,6 +3133,7 @@ async function executeDeletion(ctx, body, tokenRecord) {
     if (wasOpen || isSessionOpen(ctx, id)) {
       await deferPending(id, `Session ${id}: files were removed now; its workspace and archive records will be finalized on the next Harness start.`)
       factCache.delete(id)
+      await saveProgress()
       continue
     }
 
@@ -3067,6 +3152,7 @@ async function executeDeletion(ctx, body, tokenRecord) {
     if (!detached) {
       await deferPending(id, `Session ${id}: its files were removed, but detaching from its workspace failed; bookkeeping will be retried on the next Harness start.`)
       factCache.delete(id)
+      await saveProgress()
       continue
     }
     try {
@@ -3075,6 +3161,7 @@ async function executeDeletion(ctx, body, tokenRecord) {
       report.errors.push({ scope: 'unarchive', id, message: formatError(error) })
       await deferPending(id, `Session ${id}: its files were removed, but unarchiving failed; bookkeeping will be retried on the next Harness start.`)
       factCache.delete(id)
+      await saveProgress()
       continue
     }
     try {
@@ -3084,6 +3171,7 @@ async function executeDeletion(ctx, body, tokenRecord) {
       await deferPending(id, `Session ${id}: its files were removed, but unpinning failed; bookkeeping will be retried on the next Harness start.`)
     }
     factCache.delete(id)
+    await saveProgress()
   }
 
   let protectedAttachments = null
@@ -3121,6 +3209,9 @@ async function executeDeletion(ctx, body, tokenRecord) {
   }
 
   const blocks = (set, key) => set === 'all' || (set !== null && set.has(key))
+
+  journal.phase = 'artifacts'
+  await saveProgress()
 
   for (const spill of preview.spills || []) {
     if (blocks(protectedSpills, spill.id)) {
@@ -3213,6 +3304,12 @@ async function executeDeletion(ctx, body, tokenRecord) {
     errors: report.errors.length,
     warnings: report.warnings.length,
   }
+  journal.phase = 'done'
+  journal.status = report.errors.length > 0 || report.sessions.removed < selectedIds.size ? 'partial' : 'completed'
+  journal.summary = report.summary
+  journal.errors = report.errors.slice(0, 50)
+  journal.warnings = report.warnings.slice(0, 50)
+  await saveProgress()
   completeRecord(tokenRecord)
   return report
 }
@@ -3247,6 +3344,10 @@ export function apply(ctx) {
       const op = typeof body.op === 'string' ? body.op : ''
       if (op === 'list') {
         sendJson(res, 200, { ok: true, value: await listArchived(ctx) })
+        return
+      }
+      if (op === 'journal') {
+        sendJson(res, 200, { ok: true, value: { journal: await readJournalRecord() ?? null } })
         return
       }
       if (op === 'project-path') {
@@ -3310,6 +3411,9 @@ export function apply(ctx) {
 
   void finalizePending(ctx).catch((error) => {
     ctx.logger?.warn?.(`session-cleaner: pending finalization failed: ${formatError(error)}`)
+  })
+  void markInterruptedJournal(ctx).catch((error) => {
+    ctx.logger?.warn?.(`session-cleaner: interrupted journal check failed: ${formatError(error)}`)
   })
 }
 

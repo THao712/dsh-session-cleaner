@@ -57,6 +57,9 @@ async function makeHarness(options = {}) {
   if (Array.isArray(options.pendingIds) && options.pendingIds.length > 0) {
     await writeFile(join(home, 'session-cleaner-pending.json'), JSON.stringify(options.pendingIds))
   }
+  if (options.journal !== undefined) {
+    await writeFile(join(home, 'session-cleaner-journal.json'), JSON.stringify(options.journal))
+  }
   let route
   const ctx = {
     effect(fn) { return fn() },
@@ -671,6 +674,66 @@ test('session cleaner safety regressions', async (t) => {
       await assert.rejects(access(harness.sessionDir), /ENOENT/)
       const pending = JSON.parse(await readFile(join(harness.home, 'session-cleaner-pending.json'), 'utf8'))
       assert.ok(pending.includes(harness.id))
+      const journal = JSON.parse(await readFile(join(harness.home, 'session-cleaner-journal.json'), 'utf8'))
+      assert.equal(journal.status, 'partial')
+      assert.equal(journal.phase, 'done')
+      assert.ok(journal.completedSessions.includes(harness.id))
+      assert.ok(journal.pending.includes(harness.id))
+    } finally {
+      await harness.cleanup()
+    }
+  })
+
+  await t.test('a completed cleanup writes a journal record', async () => {
+    const harness = await makeHarness()
+    try {
+      const options = { attachments: false, workspaceFiles: false, scanCreated: false, spills: false, conversationFolder: false, imageCache: false }
+      const preview = await harness.call('preview', { ids: [harness.id], options })
+      const deleted = await harness.call('delete', {
+        ids: [harness.id], options, previewToken: preview.value.previewToken,
+        confirmed: true, files: [], attachments: [],
+      })
+      assert.equal(deleted.ok, true)
+      const journal = await harness.call('journal', {})
+      assert.equal(journal.ok, true)
+      assert.equal(journal.value.journal.status, 'completed')
+      assert.equal(journal.value.journal.phase, 'done')
+      assert.deepEqual(journal.value.journal.ids, [harness.id])
+      assert.deepEqual(journal.value.journal.completedSessions, [harness.id])
+      assert.match(journal.value.journal.fingerprintHash, /^[0-9a-f]{64}$/)
+      assert.equal(journal.value.journal.summary.removedSessions, 1)
+    } finally {
+      await harness.cleanup()
+    }
+  })
+
+  await t.test('a running journal is marked interrupted at startup', async () => {
+    const id = nextId()
+    const harness = await makeHarness({
+      id,
+      journal: {
+        version: 1,
+        id: 'interrupted-task',
+        createdAt: Date.now() - 1000,
+        updatedAt: Date.now() - 1000,
+        status: 'running',
+        phase: 'bookkeeping',
+        ids: [id],
+        options: {},
+        completedSessions: [id],
+        failedSessions: [],
+        pending: [id],
+        summary: null,
+        errors: [],
+        warnings: [],
+      },
+    })
+    try {
+      await new Promise((resolve) => setTimeout(resolve, 100))
+      const journal = await harness.call('journal', {})
+      assert.equal(journal.value.journal.status, 'interrupted')
+      assert.equal(journal.value.journal.phase, 'bookkeeping')
+      assert.equal(typeof journal.value.journal.interruptedAt, 'number')
     } finally {
       await harness.cleanup()
     }

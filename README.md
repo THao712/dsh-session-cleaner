@@ -36,6 +36,7 @@ A DeepSeek Harness plugin that previews and permanently deletes archived Session
 - 工作区文件默认不勾选：工作区之外的文件、仍被其他会话引用的文件、会话开始前已存在的文件（例如被 `edit` 的既有源码）；前两类即使手动勾选也不会被 Host 接受。默认勾选只针对可由创建时间证明“会话期间新建”且来源为 `write` / `str_replace_editor` 的文件；`edit` / `present` / 扫描结果需要手动确认。文件创建时间晚于会话最后事件 5 分钟后，不再算作会话期间新建。
 - 删除前需要两次点击确认（“永久删除所选内容” → “确认永久删除”）；操作不可撤销。
 - 驻留会话的收尾：文件删除成功后，插件把会话 ID 写入 `<DSH_HOME>/session-cleaner-pending.json`，保留工作区记账与归档标记直到下一次启动；启动时 `finalizePending()` 再 detach/unarchive/unpin。detach、unarchive 或 unpin 失败的普通会话也会写入 pending，下次启动重试，不再只留下警告。这样既不需要为了删除而重启，也不会产生“未分组”幽灵。
+- 每次会话清理都会在首个不可逆操作前写入 `<DSH_HOME>/session-cleaner-journal.json`，记录任务 ID、已确认的会话/选项、预览指纹摘要、当前阶段、已处理/失败/待收尾会话和最终报告摘要。进程中断后，下次启动会把 `running` 记录标记为 `interrupted`；设置页会显示上次任务，但不会自动重放删除，必须重新预览确认。
 - 目录统计与递归清单在同一次遍历中完成；扫描受条目预算限制，超限、权限不足或读取失败会显示为“不完整”，整目录删除会被阻止，而不是把部分大小当作完整大小。
 
 ## 安装
@@ -71,6 +72,7 @@ plugin_manager install_bundle  target: <仓库绝对路径>
 
 - Host：`dsh-session-cleaner-thao712` 的 `index.js`，注册 `POST /dsh-session-cleaner/api`，使用 `connection.requestRejection()` 做 Host/Origin 围栏与登录态校验。
 - Client：`client.js` 注册 `settings.section`（id `session-cleaner`）。
+- `journal` 返回最近一次会话清理任务的 journal；设置页在任务中断或部分完成时显示任务 ID、阶段、已处理/失败/待收尾数量和重新预览提示。
 - `preview` 返回短期 `previewToken`；`delete` 必须携带该 token，并重新推导候选、比较文件身份与会话目录清单摘要，避免执行用户没看过的预览。同一 token 只能执行一次，执行中或已完成会分别返回 `preview-in-use` / `preview-consumed`。
 - 对话目录：`folders` 返回目录清单与 `previewToken`；token 为每个目录保存独立指纹，`folders-delete` 只校验本次实际选中的目录，重新扫描目录大小/修改时间/递归清单/状态指纹。删除前再次校验目录位于 `conversations/` 直接子目录、不是 symlink/Junction、元数据匹配（有 `session.json` 时）；运行中的目录被拒绝，已加载但空闲的目录允许清理。
 - 会话日志路径由 JSONL 后端的确定性布局推导，并在删除前再次校验目录名与根目录归属。
@@ -89,6 +91,7 @@ plugin_manager install_bundle  target: <仓库绝对路径>
 - 共享引用检查其余会话日志与当前 live events 中的工具路径；其他进程、未提交草稿、外部程序直接引用同一附件对象的情况仍无法完全证明安全。相关文件/附件会被保留或要求逐项确认。
 - 运行中状态和“已打开”都只在当前 Host 进程内检测；另一个 Host 进程若仍打开同一会话，本插件无法看到它的写入锁。请确保该会话没有被其他进程使用。归档不会自动卸载 Agent，但已打开的空闲会话可以在不重启的情况下清理文件；工作区/归档记账会在下次启动自动收尾。
 - 预览与确认之间文件内容可能变化；执行时会重新推导候选、校验文件身份和目录递归清单，并拒绝已失效的路径。内容哈希成本较高，未被纳入每次校验；重要文件请在确认前重新预览。
+- journal 只记录任务与阶段，不会在崩溃后自动重放删除；恢复需要重新选择并预览。若日志在中断后重新出现或后台写入恢复，journal 只能标记上次阶段，仍需以新预览和运行状态检查为准。
 - 若其他进程正占用日志或附件，Windows 可能拒绝删除；报告会列出失败项，可关闭占用后重试。
 - 会话搜索索引是派生索引；删除后会在后台触发一次对账。若部署禁用了搜索，残留行会在下一次成功搜索时被清除。
 - 删除文件后可能顺带移除因此变空的父目录（仅限工作区/会话目录边界内，且只移除空目录）。

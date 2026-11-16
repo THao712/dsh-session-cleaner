@@ -1106,6 +1106,12 @@ window.__ModuleLoader__.load({
           }
         }, [load, loadJournal])
 
+        useEffect(() => {
+          if (lastRun === null || lastRun.status !== 'running') return undefined
+          const timer = setInterval(() => { void loadJournal() }, 3000)
+          return () => clearInterval(timer)
+        }, [lastRun, loadJournal])
+
         const openWorkspace = async (session) => {
           setOpeningId(session.id)
           setOpenError(null)

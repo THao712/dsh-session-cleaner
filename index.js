@@ -64,6 +64,7 @@ const CONVERSATION_INDEX = 'index.json'
 const CONVERSATION_RULES = 'AGENTS.md'
 const PENDING_FILE = 'session-cleaner-pending.json'
 const JOURNAL_FILE = 'session-cleaner-journal.json'
+const LOCK_FILE = 'session-cleaner.lock'
 const JOURNAL_VERSION = 1
 const KNOWN_FOLDER_ENTRIES = new Set(['work', 'out', CONVERSATION_METADATA, 'AGENTS.md'])
 
@@ -2065,6 +2066,67 @@ async function persistJournal(record) {
   return withJournalLock(() => writeJsonAtomic(journalPath(), record))
 }
 
+function cleanupLockPath() {
+  return join(homeDirectory(), LOCK_FILE)
+}
+
+/**
+ * Cross-process mutex for cleanup operations sharing one DSH_HOME. The
+ * in-process queue is still the first line of defence; this file prevents a
+ * second Host process from starting an overlapping deletion. A lock owned by a
+ * dead PID is recovered automatically.
+ */
+async function acquireCleanupLock(label) {
+  const path = cleanupLockPath()
+  for (let attempt = 0; attempt < 3; attempt += 1) {
+    const token = randomBytes(12).toString('hex')
+    const record = {
+      token,
+      pid: process.pid,
+      label,
+      startedAt: Date.now(),
+    }
+    try {
+      await writeFile(path, `${JSON.stringify(record, null, 2)}\n`, { encoding: 'utf8', flag: 'wx' })
+      return async () => {
+        try {
+          const current = await readJsonFileDetailed(path)
+          if (current.value !== null && typeof current.value === 'object' && current.value.token === token) {
+            await unlink(path)
+          }
+        } catch {
+          /* a lock that cannot be cleaned will become stale after its PID exits */
+        }
+      }
+    } catch (error) {
+      if (errorCode(error) !== 'EEXIST') {
+        throw new HttpError(500, 'lock-failed', `Cannot create the cleanup lock: ${formatError(error)}`)
+      }
+    }
+    const current = await readJsonFileDetailed(path)
+    const owner = current.value !== null && typeof current.value === 'object' ? current.value : undefined
+    if (owner !== undefined && typeof owner.pid === 'number' && owner.pid !== process.pid) {
+      let alive = true
+      try {
+        process.kill(owner.pid, 0)
+      } catch (error) {
+        alive = errorCode(error) !== 'ESRCH'
+      }
+      if (alive) {
+        throw new HttpError(409, 'cleanup-locked', `Another Harness process (PID ${owner.pid}) is already running a cleanup task.`)
+      }
+    }
+    try {
+      await unlink(path)
+    } catch (error) {
+      if (errorCode(error) !== 'ENOENT') {
+        throw new HttpError(409, 'cleanup-locked', 'A cleanup lock exists and cannot be cleared.')
+      }
+    }
+  }
+  throw new HttpError(409, 'cleanup-locked', 'Could not acquire the cleanup lock; retry after the other cleanup finishes.')
+}
+
 async function markInterruptedJournal(ctx) {
   return withJournalLock(async () => {
     const record = await readJournalRecord()
@@ -3437,7 +3499,14 @@ export function apply(ctx) {
       if (op === 'delete') {
         const tokenRecord = claimPreviewToken(body.previewToken)
         try {
-          const value = await withDeletionLock(() => executeDeletion(ctx, body, tokenRecord))
+          const value = await withDeletionLock(async () => {
+            const release = await acquireCleanupLock('session-cleanup')
+            try {
+              return await executeDeletion(ctx, body, tokenRecord)
+            } finally {
+              await release()
+            }
+          })
           sendJson(res, 200, { ok: true, value })
         } catch (error) {
           releaseRecord(tokenRecord)
@@ -3454,7 +3523,14 @@ export function apply(ctx) {
       if (op === 'folders-delete') {
         const tokenRecord = claimFolderPreviewToken(body.previewToken)
         try {
-          const value = await withDeletionLock(() => executeFolderDeletion(ctx, body, tokenRecord))
+          const value = await withDeletionLock(async () => {
+            const release = await acquireCleanupLock('conversation-folder-cleanup')
+            try {
+              return await executeFolderDeletion(ctx, body, tokenRecord)
+            } finally {
+              await release()
+            }
+          })
           sendJson(res, 200, { ok: true, value })
         } catch (error) {
           releaseRecord(tokenRecord)

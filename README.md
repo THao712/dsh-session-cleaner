@@ -32,6 +32,7 @@ A DeepSeek Harness plugin that previews and permanently deletes archived Session
 - 会话专用目录必须位于某个工作区下，且目录内 `session.json` 的 `sessionId`、`workspace`、`folder` 与当前会话完全匹配。共享判断统一覆盖：其他会话的 cwd 等于目录、cwd 位于目录内部、显式文件/交付路径位于目录内部，以及 parent/child 子会话关系；冷会话和已加载会话使用同一套判断。删除前会扫描其余会话（包括运行中会话的 live events），目录仍被其他会话使用时保留。`index.json` 只移除当前会话的条目，并做读回校验与并发条目合并；不会重建或覆盖其他条目。
 - 预览 token 现在同时绑定：会话 revision、文件身份（dev/ino/size/mtime/ctime/birthtime）、会话目录递归清单摘要、选项和候选集合。预览后文件被改写、替换、删除后重建，或目录中新增/删除/深层变化，都会使原 token 失效，必须重新预览。
 - token 在首次异步执行前即被占用；同一 token 的并发请求会得到 `preview-in-use` / `preview-consumed`，最多执行一次。会话清理与目录清理共用 Host 内写操作队列；pending 的追加、移除和启动收尾也串行更新。
+- 会话清理与目录清理在 `<DSH_HOME>/session-cleaner.lock` 上建立跨进程锁。另一个仍存活的 Host 进程正在清理时返回 `cleanup-locked`；进程退出后遗留的锁会按 PID 判定并自动清理。
 - 受保护区域：`DSH_HOME` 的会话/存储/附件/缓存/配置目录、Harness 安装目录、系统目录、用户主目录下的 `.ssh` / `.aws` / `.gnupg` / `.kube` / `.config`，以及任何 `session.*.jsonl*` / `session.json` / `conversations/index.json` / `workspace.json` / `settings.yaml` / 凭据文件。
 - 工作区文件默认不勾选：工作区之外的文件、仍被其他会话引用的文件、会话开始前已存在的文件（例如被 `edit` 的既有源码）；前两类即使手动勾选也不会被 Host 接受。默认勾选只针对可由创建时间证明“会话期间新建”且来源为 `write` / `str_replace_editor` 的文件；`edit` / `present` / 扫描结果需要手动确认。文件创建时间晚于会话最后事件 5 分钟后，不再算作会话期间新建。
 - 删除前需要两次点击确认（“永久删除所选内容” → “确认永久删除”）；操作不可撤销。

@@ -1111,6 +1111,36 @@ test('session cleaner safety regressions', async (t) => {
     }
   })
 
+  await t.test('a live cross-process cleanup lock blocks deletion', async () => {
+    const harness = await makeHarness()
+    try {
+      const options = { attachments: false, workspaceFiles: false, scanCreated: false, spills: false, conversationFolder: false, imageCache: false }
+      const preview = await harness.call('preview', { ids: [harness.id], options })
+      const lock = join(harness.home, 'session-cleaner.lock')
+      await writeFile(lock, JSON.stringify({
+        token: 'foreign-lock',
+        pid: process.ppid,
+        label: 'other-host',
+        startedAt: Date.now(),
+      }))
+      const blocked = await harness.call('delete', {
+        ids: [harness.id], options, previewToken: preview.value.previewToken,
+        confirmed: true, files: [], attachments: [],
+      })
+      assert.equal(blocked.ok, false)
+      assert.equal(blocked.error.code, 'cleanup-locked')
+      await access(harness.sessionDir)
+      await rm(lock, { force: true })
+      const retried = await harness.call('delete', {
+        ids: [harness.id], options, previewToken: preview.value.previewToken,
+        confirmed: true, files: [], attachments: [],
+      })
+      assert.equal(retried.ok, true)
+    } finally {
+      await harness.cleanup()
+    }
+  })
+
   await t.test('concurrent deletes preserve both pending ids', async () => {
     const firstId = nextId()
     const secondId = nextId()

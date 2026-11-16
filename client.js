@@ -76,6 +76,8 @@ window.__ModuleLoader__.load({
         foldersTitle: '对话目录',
         foldersIntro: '扫描每个工作区 conversations 下的会话目录。out/ 是终产物，work/ 是中间文件；残留目录通常是会话记录已删除但文件夹还在。',
         foldersEmpty: '没有找到对话目录。',
+        foldersIdle: '对话目录尚未加载，加载时会扫描各工作区的 conversations 目录。',
+        foldersLoad: '加载对话目录',
         foldersLoading: '正在读取对话目录…',
         foldersFailed: '读取对话目录失败：{message}',
         folderSelectAll: '全选目录',
@@ -268,6 +270,8 @@ window.__ModuleLoader__.load({
         foldersTitle: 'Conversation folders',
         foldersIntro: 'Scans the conversation folders under each workspace conversations directory. out/ holds deliverables and work/ holds intermediate files; leftovers are usually folders whose Session log is already gone.',
         foldersEmpty: 'No conversation folder was found.',
+        foldersIdle: 'Conversation folders are not loaded yet. Loading scans every workspace conversations directory.',
+        foldersLoad: 'Load conversation folders',
         foldersLoading: 'Reading conversation folders…',
         foldersFailed: 'Could not read conversation folders: {message}',
         folderSelectAll: 'Select all folders',
@@ -971,7 +975,7 @@ window.__ModuleLoader__.load({
         const [openingId, setOpeningId] = useState(null)
         const [openError, setOpenError] = useState(null)
         const [folders, setFolders] = useState([])
-        const [folderPhase, setFolderPhase] = useState('loading')
+        const [folderPhase, setFolderPhase] = useState('idle')
         const [folderError, setFolderError] = useState(null)
         const [folderChoice, setFolderChoice] = useState(() => new Map())
         const [folderToken, setFolderToken] = useState(null)
@@ -1069,14 +1073,13 @@ window.__ModuleLoader__.load({
 
         useEffect(() => {
           load()
-          loadFolders()
           loadJournal()
           return () => {
             loadAbort.current?.abort()
             previewAbort.current?.abort()
             folderSeq.current += 1
           }
-        }, [load, loadFolders, loadJournal])
+        }, [load, loadJournal])
 
         const openWorkspace = async (session) => {
           setOpeningId(session.id)
@@ -1873,24 +1876,30 @@ window.__ModuleLoader__.load({
               'div',
               { style: STYLE.cardBody },
               h('p', { style: STYLE.meta }, t('foldersIntro')),
-              folderPhase === 'loading'
-                ? h('div', { style: STYLE.empty }, t('foldersLoading'))
-                : folderPhase === 'error'
-                  ? h('div', { style: STYLE.error }, t('foldersFailed', { message: folderError || '' }))
-                  : folders.length === 0
-                    ? h('div', { style: STYLE.empty }, t('foldersEmpty'))
-                    : h(
-                        'div',
-                        { style: STYLE.list },
-                        folders.map((folder, index) => h(FolderRow, {
-                          key: folder.key,
-                          folder,
-                          mode: folderChoice.get(folder.key) ?? null,
-                          onToggle: toggleFolder,
-                          onMode: setFolderMode,
-                          last: index === folders.length - 1,
-                        })),
-                      ),
+              folderPhase === 'idle'
+                ? h('div',
+                    { style: STYLE.inline },
+                    h('div', { style: STYLE.empty }, t('foldersIdle')),
+                    h('button', { type: 'button', style: STYLE.button, onClick: loadFolders }, t('foldersLoad')),
+                  )
+                : folderPhase === 'loading'
+                  ? h('div', { style: STYLE.empty }, t('foldersLoading'))
+                  : folderPhase === 'error'
+                    ? h('div', { style: STYLE.error }, t('foldersFailed', { message: folderError || '' }))
+                    : folders.length === 0
+                      ? h('div', { style: STYLE.empty }, t('foldersEmpty'))
+                      : h(
+                          'div',
+                          { style: STYLE.list },
+                          folders.map((folder, index) => h(FolderRow, {
+                            key: folder.key,
+                            folder,
+                            mode: folderChoice.get(folder.key) ?? null,
+                            onToggle: toggleFolder,
+                            onMode: setFolderMode,
+                            last: index === folders.length - 1,
+                          })),
+                        ),
               h(
                 'div',
                 { style: { ...STYLE.actions, marginTop: 10 } },

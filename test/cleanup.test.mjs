@@ -26,9 +26,15 @@ async function makeHarness(options = {}) {
   if (!eventsById.has(id)) eventsById.set(id, events)
   const liveById = new Map(options.live ?? [])
   const openErrorIds = new Set(options.openErrorIds ?? [])
-  const sessionDir = join(home, 'sessions', '--test--', id)
-  await mkdir(sessionDir, { recursive: true })
-  await writeFile(join(sessionDir, 'session.v4.jsonl.zstd'), 'test')
+  const sessionIds = options.sessionIds ?? [id]
+  const sessionDirs = new Map()
+  for (const sessionId of sessionIds) {
+    const directory = join(home, 'sessions', '--test--', sessionId)
+    await mkdir(directory, { recursive: true })
+    await writeFile(join(directory, 'session.v4.jsonl.zstd'), 'test')
+    sessionDirs.set(sessionId, directory)
+  }
+  const sessionDir = sessionDirs.get(id)
   if (options.projection === true) {
     await mkdir(join(home, 'storages', 'session_projcache', 'sessions'), { recursive: true })
     await writeFile(join(home, 'storages', 'session_projcache', 'sessions', `${id}.json`), '{}')
@@ -38,7 +44,7 @@ async function makeHarness(options = {}) {
     id: 'workspace-1',
     title: 'Workspace',
     path: workspacePath,
-    sessionIds: [id],
+    sessionIds: [...sessionIds],
     detached: [],
     attached: [],
     async detachSession(sessionId) {
@@ -47,7 +53,7 @@ async function makeHarness(options = {}) {
     },
     async attachSession(sessionId) { this.attached.push(sessionId) },
   }
-  const archived = new Set([id])
+  const archived = new Set(options.archivedIds ?? [id])
   if (Array.isArray(options.pendingIds) && options.pendingIds.length > 0) {
     await writeFile(join(home, 'session-cleaner-pending.json'), JSON.stringify(options.pendingIds))
   }
@@ -121,6 +127,7 @@ async function makeHarness(options = {}) {
     selected,
     snapshots,
     sessionDir,
+    sessionDirs,
     archived,
     call,
     async cleanup() { await rm(root, { recursive: true, force: true }) },
@@ -158,7 +165,7 @@ test('session cleaner safety regressions', async (t) => {
         attachments: [],
       })
       assert.equal(reused.ok, false)
-      assert.equal(reused.error.code, 'preview-required')
+      assert.equal(reused.error.code, 'preview-consumed')
     } finally {
       await harness.cleanup()
     }
@@ -275,6 +282,7 @@ test('session cleaner safety regressions', async (t) => {
       const preview = await harness.call('preview', { ids: [harness.id], options })
       assert.equal(preview.value.files.length, 1)
       assert.equal(preview.value.files[0].deletable, true)
+      assert.equal(preview.value.files[0].selectedByDefault, true)
       const deleted = await harness.call('delete', {
         ids: [harness.id], options, previewToken: preview.value.previewToken,
         confirmed: true, files: [file], attachments: [],
@@ -658,8 +666,387 @@ test('session cleaner safety regressions', async (t) => {
       assert.equal(deleted.ok, true)
       assert.equal(deleted.value.sessions.removed, 1)
       assert.equal(deleted.value.errors.some((error) => error.scope === 'workspace'), true)
+      assert.equal(deleted.value.sessions.deferred, 1)
       assert.equal(harness.archived.has(harness.id), true)
       await assert.rejects(access(harness.sessionDir), /ENOENT/)
+      const pending = JSON.parse(await readFile(join(harness.home, 'session-cleaner-pending.json'), 'utf8'))
+      assert.ok(pending.includes(harness.id))
+    } finally {
+      await harness.cleanup()
+    }
+  })
+
+  await t.test('an explicit file reference blocks both folder cleanups', async () => {
+    const workspacePath = join(tmpdir(), `dsh-shared-file-ws-${Date.now()}-${sequence}`)
+    const id = nextId()
+    const otherId = nextId()
+    const folder = join(workspacePath, 'conversations', 'conversation')
+    await mkdir(join(folder, 'work'), { recursive: true })
+    await mkdir(join(folder, 'out'), { recursive: true })
+    await writeFile(join(folder, 'work', 'draft.txt'), 'draft')
+    const shared = join(folder, 'out', 'shared.txt')
+    await writeFile(shared, 'shared')
+    await writeFile(join(folder, 'session.json'), JSON.stringify({ sessionId: id, workspace: workspacePath, folder: 'conversation' }))
+    await writeFile(join(workspacePath, 'conversations', 'index.json'), JSON.stringify({ [id]: { folder: 'conversation' } }))
+    const cwdEvent = { type: 'working-directory/change', seq: 0, time: Date.now(), data: { cwd: folder } }
+    const presentEvent = {
+      type: 'tool/call', seq: 0, time: Date.now(),
+      data: { turn: 1, step: 1, callId: 'c1', name: 'present', arguments: JSON.stringify({ files: [{ path: shared }] }) },
+    }
+    const harness = await makeHarness({
+      id,
+      workspacePath,
+      eventsById: new Map([[id, [cwdEvent]], [otherId, [presentEvent]]]),
+      snapshots: [
+        { header: { id, cwd: workspacePath, createdAt: Date.now() - 600000 }, revision: 'r1' },
+        { header: { id: otherId, cwd: workspacePath, createdAt: Date.now() - 900000 }, revision: 'r2' },
+      ],
+    })
+    try {
+      const options = { attachments: false, workspaceFiles: false, scanCreated: false, spills: false, conversationFolder: true, imageCache: false }
+      const preview = await harness.call('preview', { ids: [id], options })
+      const entry = preview.value.sessions[0].conversationFolder
+      assert.equal(entry.deletable, false)
+      assert.ok(entry.sharedWith.includes(otherId))
+      assert.deepEqual(entry.sharedReasons.find((item) => item.id === otherId).reasons, ['out-file'])
+      const list = await harness.call('folders', {})
+      const row = list.value.folders.find((item) => item.name === 'conversation')
+      assert.ok(row.sharedWith.includes(otherId))
+      assert.equal(row.allDeletable, false)
+      assert.equal(row.keepOutDeletable, true)
+      const deleted = await harness.call('delete', {
+        ids: [id], options, previewToken: preview.value.previewToken,
+        confirmed: true, files: [], attachments: [],
+      })
+      assert.equal(deleted.ok, true)
+      assert.equal(deleted.value.conversation.skipped, 1)
+      await access(shared)
+      const after = await harness.call('folders', {})
+      const afterRow = after.value.folders.find((item) => item.name === 'conversation')
+      const kept = await harness.call('folders-delete', {
+        previewToken: after.value.previewToken,
+        confirmed: true,
+        folders: [{ key: afterRow.key, mode: 'keepOut' }],
+      })
+      assert.equal(kept.ok, true)
+      assert.equal(kept.value.folders.keptOut, 1)
+      await assert.rejects(access(join(folder, 'work')), /ENOENT/)
+      await access(shared)
+    } finally {
+      await harness.cleanup()
+    }
+  })
+
+  await t.test('a nested cwd blocks both folder cleanups', async () => {
+    const workspacePath = join(tmpdir(), `dsh-nested-cwd-ws-${Date.now()}-${sequence}`)
+    const id = nextId()
+    const otherId = nextId()
+    const folder = join(workspacePath, 'conversations', 'conversation')
+    await mkdir(join(folder, 'work'), { recursive: true })
+    await writeFile(join(folder, 'session.json'), JSON.stringify({ sessionId: id, workspace: workspacePath, folder: 'conversation' }))
+    await writeFile(join(workspacePath, 'conversations', 'index.json'), JSON.stringify({ [id]: { folder: 'conversation' } }))
+    const cwdEvent = { type: 'working-directory/change', seq: 0, time: Date.now(), data: { cwd: folder } }
+    const nestedEvent = { type: 'working-directory/change', seq: 0, time: Date.now(), data: { cwd: join(folder, 'work') } }
+    const harness = await makeHarness({
+      id,
+      workspacePath,
+      eventsById: new Map([[id, [cwdEvent]], [otherId, [nestedEvent]]]),
+      snapshots: [
+        { header: { id, cwd: workspacePath, createdAt: Date.now() - 600000 }, revision: 'r1' },
+        { header: { id: otherId, cwd: workspacePath, createdAt: Date.now() - 900000 }, revision: 'r2' },
+      ],
+    })
+    try {
+      const options = { attachments: false, workspaceFiles: false, scanCreated: false, spills: false, conversationFolder: true, imageCache: false }
+      const preview = await harness.call('preview', { ids: [id], options })
+      const entry = preview.value.sessions[0].conversationFolder
+      assert.equal(entry.deletable, false)
+      assert.deepEqual(entry.sharedReasons.find((item) => item.id === otherId).reasons, ['nested-cwd'])
+      const list = await harness.call('folders', {})
+      const row = list.value.folders.find((item) => item.name === 'conversation')
+      assert.equal(row.allDeletable, false)
+      assert.ok(row.sharedWith.includes(otherId))
+    } finally {
+      await harness.cleanup()
+    }
+  })
+
+  await t.test('a similar sibling directory is not treated as contained', async () => {
+    const workspacePath = join(tmpdir(), `dsh-prefix-ws-${Date.now()}-${sequence}`)
+    const id = nextId()
+    const otherId = nextId()
+    const folder = join(workspacePath, 'conversations', 'conversation-a')
+    const sibling = join(workspacePath, 'conversations', 'conversation-ab')
+    await mkdir(folder, { recursive: true })
+    await mkdir(sibling, { recursive: true })
+    await writeFile(join(folder, 'session.json'), JSON.stringify({ sessionId: id, workspace: workspacePath, folder: 'conversation-a' }))
+    await writeFile(join(workspacePath, 'conversations', 'index.json'), JSON.stringify({ [id]: { folder: 'conversation-a' } }))
+    const cwdEvent = { type: 'working-directory/change', seq: 0, time: Date.now(), data: { cwd: folder } }
+    const siblingEvent = { type: 'working-directory/change', seq: 0, time: Date.now(), data: { cwd: sibling } }
+    const harness = await makeHarness({
+      id,
+      workspacePath,
+      eventsById: new Map([[id, [cwdEvent]], [otherId, [siblingEvent]]]),
+      snapshots: [
+        { header: { id, cwd: workspacePath, createdAt: Date.now() - 600000 }, revision: 'r1' },
+        { header: { id: otherId, cwd: workspacePath, createdAt: Date.now() - 900000 }, revision: 'r2' },
+      ],
+    })
+    try {
+      const options = { attachments: false, workspaceFiles: false, scanCreated: false, spills: false, conversationFolder: true, imageCache: false }
+      const preview = await harness.call('preview', { ids: [id], options })
+      assert.equal(preview.value.sessions[0].conversationFolder.deletable, true)
+      const list = await harness.call('folders', {})
+      const row = list.value.folders.find((item) => item.name === 'conversation-a')
+      assert.equal(row.allDeletable, true)
+    } finally {
+      await harness.cleanup()
+    }
+  })
+
+  await t.test('a file recreated after the Session is not selected by default', async () => {
+    const workspacePath = join(tmpdir(), `dsh-time-ws-${Date.now()}-${sequence}`)
+    await mkdir(workspacePath, { recursive: true })
+    const file = join(workspacePath, 'recreated.txt')
+    await writeFile(file, 'new')
+    const id = nextId()
+    const createdAt = Date.now() - 3600000
+    const eventTime = Date.now() - 3000000
+    const harness = await makeHarness({
+      id,
+      workspacePath,
+      snapshots: [{ header: { id, cwd: workspacePath, createdAt }, revision: 'r1' }],
+      events: [{
+        type: 'tool/call', seq: 0, time: eventTime,
+        data: { turn: 1, step: 1, callId: 'c1', name: 'edit', arguments: JSON.stringify({ file_path: file }) },
+      }],
+    })
+    try {
+      const options = { attachments: false, workspaceFiles: true, scanCreated: false, spills: false, conversationFolder: false, imageCache: false }
+      const preview = await harness.call('preview', { ids: [id], options })
+      assert.equal(preview.value.files[0].timeEvidence, 'after-session')
+      assert.equal(preview.value.files[0].createdDuring, false)
+      assert.equal(preview.value.files[0].selectedByDefault, false)
+      assert.equal(preview.value.files[0].deletable, true)
+    } finally {
+      await harness.cleanup()
+    }
+  })
+
+  await t.test('a changed file invalidates the preview', async () => {
+    const workspacePath = join(tmpdir(), `dsh-change-ws-${Date.now()}-${sequence}`)
+    await mkdir(workspacePath, { recursive: true })
+    const file = join(workspacePath, 'changing.txt')
+    await writeFile(file, 'before')
+    const harness = await makeHarness({
+      workspacePath,
+      events: [{
+        type: 'tool/call', seq: 0, time: Date.now(),
+        data: { turn: 1, step: 1, callId: 'c1', name: 'write', arguments: JSON.stringify({ file_path: file }) },
+      }],
+    })
+    try {
+      const options = { attachments: false, workspaceFiles: true, scanCreated: false, spills: false, conversationFolder: false, imageCache: false }
+      const preview = await harness.call('preview', { ids: [harness.id], options })
+      await writeFile(file, 'changed content is longer')
+      const deleted = await harness.call('delete', {
+        ids: [harness.id], options, previewToken: preview.value.previewToken,
+        confirmed: true, files: [file], attachments: [],
+      })
+      assert.equal(deleted.ok, false)
+      assert.equal(deleted.error.code, 'stale-preview')
+      await access(file)
+    } finally {
+      await harness.cleanup()
+    }
+  })
+
+  await t.test('a changed Session log invalidates the preview', async () => {
+    const harness = await makeHarness()
+    try {
+      const options = { attachments: false, workspaceFiles: false, scanCreated: false, spills: false, conversationFolder: false, imageCache: false }
+      const preview = await harness.call('preview', { ids: [harness.id], options })
+      await writeFile(join(harness.sessionDir, 'session.v4.jsonl.zstd.lock'), 'lock')
+      const deleted = await harness.call('delete', {
+        ids: [harness.id], options, previewToken: preview.value.previewToken,
+        confirmed: true, files: [], attachments: [],
+      })
+      assert.equal(deleted.ok, false)
+      assert.equal(deleted.error.code, 'stale-preview')
+      await access(harness.sessionDir)
+    } finally {
+      await harness.cleanup()
+    }
+  })
+
+  await t.test('a new out file invalidates the folder preview', async () => {
+    const workspacePath = join(tmpdir(), `dsh-out-change-ws-${Date.now()}-${sequence}`)
+    const id = nextId()
+    const folder = join(workspacePath, 'conversations', 'conversation')
+    await mkdir(join(folder, 'out'), { recursive: true })
+    await writeFile(join(folder, 'out', 'before.txt'), 'before')
+    await writeFile(join(folder, 'session.json'), JSON.stringify({ sessionId: id, workspace: workspacePath, folder: 'conversation' }))
+    await writeFile(join(workspacePath, 'conversations', 'index.json'), JSON.stringify({ [id]: { folder: 'conversation' } }))
+    const harness = await makeHarness({
+      id,
+      workspacePath,
+      events: [{ type: 'working-directory/change', seq: 0, time: Date.now(), data: { cwd: folder } }],
+    })
+    try {
+      const options = { attachments: false, workspaceFiles: false, scanCreated: false, spills: false, conversationFolder: true, imageCache: false }
+      const preview = await harness.call('preview', { ids: [id], options })
+      assert.equal(preview.value.sessions[0].conversationFolder.deletable, true)
+      await writeFile(join(folder, 'out', 'after.txt'), 'after')
+      const deleted = await harness.call('delete', {
+        ids: [id], options, previewToken: preview.value.previewToken,
+        confirmed: true, files: [], attachments: [],
+      })
+      assert.equal(deleted.ok, false)
+      assert.equal(deleted.error.code, 'stale-preview')
+      await access(join(folder, 'out', 'after.txt'))
+    } finally {
+      await harness.cleanup()
+    }
+  })
+
+  await t.test('a new work file invalidates the folder-list token', async () => {
+    const workspacePath = join(tmpdir(), `dsh-work-change-ws-${Date.now()}-${sequence}`)
+    const id = nextId()
+    const folder = join(workspacePath, 'conversations', 'conversation')
+    await mkdir(join(folder, 'work'), { recursive: true })
+    await writeFile(join(folder, 'work', 'before.py'), 'before')
+    await writeFile(join(folder, 'session.json'), JSON.stringify({ sessionId: id, workspace: workspacePath, folder: 'conversation' }))
+    await writeFile(join(workspacePath, 'conversations', 'index.json'), JSON.stringify({ [id]: { folder: 'conversation' } }))
+    const harness = await makeHarness({ id, workspacePath })
+    try {
+      const list = await harness.call('folders', {})
+      const row = list.value.folders.find((entry) => entry.name === 'conversation')
+      await writeFile(join(folder, 'work', 'after.py'), 'after')
+      const result = await harness.call('folders-delete', {
+        previewToken: list.value.previewToken,
+        confirmed: true,
+        folders: [{ key: row.key, mode: 'keepOut' }],
+      })
+      assert.equal(result.ok, false)
+      assert.equal(result.error.code, 'stale-preview')
+      await access(join(folder, 'work', 'after.py'))
+    } finally {
+      await harness.cleanup()
+    }
+  })
+
+  await t.test('an out-only change still allows keep-out cleanup', async () => {
+    const workspacePath = join(tmpdir(), `dsh-out-keep-ws-${Date.now()}-${sequence}`)
+    const id = nextId()
+    const folder = join(workspacePath, 'conversations', 'conversation')
+    await mkdir(join(folder, 'work'), { recursive: true })
+    await mkdir(join(folder, 'out'), { recursive: true })
+    await writeFile(join(folder, 'work', 'draft.py'), 'draft')
+    await writeFile(join(folder, 'out', 'before.txt'), 'before')
+    await writeFile(join(folder, 'session.json'), JSON.stringify({ sessionId: id, workspace: workspacePath, folder: 'conversation' }))
+    await writeFile(join(workspacePath, 'conversations', 'index.json'), JSON.stringify({ [id]: { folder: 'conversation' } }))
+    const harness = await makeHarness({ id, workspacePath })
+    try {
+      const list = await harness.call('folders', {})
+      const row = list.value.folders.find((entry) => entry.name === 'conversation')
+      await writeFile(join(folder, 'out', 'after.txt'), 'after')
+      const result = await harness.call('folders-delete', {
+        previewToken: list.value.previewToken,
+        confirmed: true,
+        folders: [{ key: row.key, mode: 'keepOut' }],
+      })
+      assert.equal(result.ok, true)
+      assert.equal(result.value.folders.keptOut, 1)
+      await assert.rejects(access(join(folder, 'work')), /ENOENT/)
+      await access(join(folder, 'out', 'after.txt'))
+    } finally {
+      await harness.cleanup()
+    }
+  })
+
+  await t.test('an unrelated folder change does not invalidate the selected folder', async () => {
+    const workspacePath = join(tmpdir(), `dsh-unrelated-ws-${Date.now()}-${sequence}`)
+    const first = join(workspacePath, 'conversations', 'conversation-a')
+    const second = join(workspacePath, 'conversations', 'conversation-b')
+    await mkdir(join(first, 'work'), { recursive: true })
+    await mkdir(join(second, 'work'), { recursive: true })
+    await writeFile(join(first, 'work', 'a.py'), 'a')
+    await writeFile(join(second, 'work', 'b.py'), 'b')
+    const harness = await makeHarness({ workspacePath })
+    try {
+      const list = await harness.call('folders', {})
+      const row = list.value.folders.find((entry) => entry.name === 'conversation-a')
+      await writeFile(join(second, 'work', 'new.py'), 'new')
+      const result = await harness.call('folders-delete', {
+        previewToken: list.value.previewToken,
+        confirmed: true,
+        folders: [{ key: row.key, mode: 'all' }],
+      })
+      assert.equal(result.ok, true)
+      assert.equal(result.value.folders.removed, 1)
+      await assert.rejects(access(first), /ENOENT/)
+      await access(join(second, 'work', 'new.py'))
+    } finally {
+      await harness.cleanup()
+    }
+  })
+
+  await t.test('concurrent execution of one preview token happens once', async () => {
+    const harness = await makeHarness()
+    try {
+      const options = { attachments: false, workspaceFiles: false, scanCreated: false, spills: false, conversationFolder: false, imageCache: false }
+      const preview = await harness.call('preview', { ids: [harness.id], options })
+      const payload = {
+        ids: [harness.id], options, previewToken: preview.value.previewToken,
+        confirmed: true, files: [], attachments: [],
+      }
+      const [first, second] = await Promise.all([
+        harness.call('delete', payload),
+        harness.call('delete', payload),
+      ])
+      assert.equal([first, second].filter((result) => result.ok).length, 1)
+      const failure = [first, second].find((result) => !result.ok)
+      assert.ok(['preview-in-use', 'preview-consumed'].includes(failure.error.code))
+    } finally {
+      await harness.cleanup()
+    }
+  })
+
+  await t.test('concurrent deletes preserve both pending ids', async () => {
+    const firstId = nextId()
+    const secondId = nextId()
+    const workspacePath = join(tmpdir(), `dsh-pending-ws-${Date.now()}-${sequence}`)
+    await mkdir(workspacePath, { recursive: true })
+    const harness = await makeHarness({
+      id: firstId,
+      workspacePath,
+      snapshots: [
+        { header: { id: firstId, cwd: workspacePath, createdAt: Date.now() - 600000 }, revision: 'r1' },
+        { header: { id: secondId, cwd: workspacePath, createdAt: Date.now() - 900000 }, revision: 'r2' },
+      ],
+      sessionIds: [firstId, secondId],
+      archivedIds: [firstId, secondId],
+      agentStatus: 'idle',
+      live: [[firstId, { snapshotEvents() { return [] } }], [secondId, { snapshotEvents() { return [] } }]],
+    })
+    try {
+      const options = { attachments: false, workspaceFiles: false, scanCreated: false, spills: false, conversationFolder: false, imageCache: false }
+      const firstPreview = await harness.call('preview', { ids: [firstId], options })
+      const secondPreview = await harness.call('preview', { ids: [secondId], options })
+      const [first, second] = await Promise.all([
+        harness.call('delete', {
+          ids: [firstId], options, previewToken: firstPreview.value.previewToken,
+          confirmed: true, files: [], attachments: [],
+        }),
+        harness.call('delete', {
+          ids: [secondId], options, previewToken: secondPreview.value.previewToken,
+          confirmed: true, files: [], attachments: [],
+        }),
+      ])
+      assert.equal(first.ok, true)
+      assert.equal(second.ok, true)
+      const pending = JSON.parse(await readFile(join(harness.home, 'session-cleaner-pending.json'), 'utf8'))
+      assert.deepEqual([...pending].sort(), [firstId, secondId].sort())
     } finally {
       await harness.cleanup()
     }

@@ -16,6 +16,7 @@ window.__ModuleLoader__.load({
     const NS = 'session-cleaner'
     const ROUTE = '/dsh-session-cleaner/api'
     const FILE_PAGE = 80
+    const MAX_SESSIONS = 200
 
     const DICTIONARIES = {
       zh: {
@@ -56,9 +57,9 @@ window.__ModuleLoader__.load({
         optAttachments: '删除仅被这些会话引用的附件',
         optAttachmentsHint: '删除前会扫描其余会话；仍被引用的附件会保留。只检查会话日志中的引用，未提交草稿或外部程序的引用无法检测。',
         optFiles: '删除这些会话在工作区产生的文件',
-        optFilesHint: '依据文件工具调用与会话时间窗生成候选；扫描到的文件默认不勾选，请在预览中确认或使用“全选文件”。',
+        optFilesHint: '依据文件工具调用与会话时间窗生成候选；只有能证明会话期间新建且来源为写入/替换编辑的文件默认勾选，edit、present 与扫描结果需要手动确认。',
         optScan: '扫描会话期间新建的文件',
-        optScanHint: '用于发现 shell、Python 等命令生成的中间文件和最终产物；扫描结果默认不勾选。',
+        optScanHint: '用于发现 shell、Python 等命令生成的中间文件和最终产物；扫描结果默认不勾选，且创建时间晚于会话最后事件 5 分钟的文件不会被算作会话期间新建。',
         optSpills: '删除会话的工具输出临时文件',
         optSpillsHint: '清理 dsh-spill 根目录下以会话哈希命名的目录（过大的工具结果溢出文件）。',
         optImageCache: '同时清空附件请求缓存',
@@ -115,6 +116,7 @@ window.__ModuleLoader__.load({
         noSpills: '没有发现该会话的溢出文件目录。',
         logDir: '日志目录',
         logFiles: '文件：{names}',
+        logSizePartial: '日志大小可能偏低',
         conversationFolder: '会话目录',
         conversationFolderSelected: '将整目录删除',
         conversationFolderKept: '保留目录',
@@ -126,6 +128,7 @@ window.__ModuleLoader__.load({
         outsideWorkspace: '位于工作区之外，已保留',
         protectedItem: '受保护，不会删除',
         missingFile: '文件已不存在',
+        fileStatFailed: '无法读取文件状态，已保留',
         symlink: '符号链接，不会删除',
         symlinkAncestor: '路径经过符号链接或 Junction，不会删除',
         referencesUnknown: '引用状态未知，已保留',
@@ -135,6 +138,16 @@ window.__ModuleLoader__.load({
         fileOrigin: '来源：{origins}',
         createdDuring: '会话期间新建',
         preExisting: '会话前已存在或创建时间未知',
+        fileTimeCreated: '会话期间新建',
+        fileTimeBefore: '会话开始前已存在',
+        fileTimeAfter: '会话结束后创建或重建',
+        fileTimeOutside: '不在所选会话时间窗内',
+        fileTimeUnknown: '创建时间未知',
+        sharedReasonsTitle: '占用原因',
+        selectedNow: '当前勾选预计释放',
+        selectAllLimit: '单次最多 {max} 个会话，已选择前 {count} 个。',
+        maxSessions: '单次最多选择 {max} 个会话。',
+        busyNote: '另一个清理任务正在执行，请等待完成。',
         originWrite: '写入',
         originEdit: '编辑',
         originReplace: '替换编辑',
@@ -224,9 +237,9 @@ window.__ModuleLoader__.load({
         optAttachments: 'Delete attachments referenced only by these Sessions',
         optAttachmentsHint: 'The remaining Sessions are scanned first; an attachment still referenced elsewhere is kept. Only Session-log references are checked; drafts and external programs are not visible.',
         optFiles: 'Delete files these Sessions produced in the workspace',
-        optFilesHint: 'Candidates come from file-tool calls and the Session time window; scanned files start unchecked. Review them or use “Select all files”.',
+        optFilesHint: 'Candidates come from file-tool calls and the Session time window. Only files provably created during the Session by write or replace-edit start checked; edit, present, and scan results need manual confirmation.',
         optScan: 'Scan for files created during the Session',
-        optScanHint: 'Finds intermediate and final files made by shell, Python, and similar commands; scan results start unchecked.',
+        optScanHint: 'Finds intermediate and final files made by shell, Python, and similar commands. Scan results start unchecked, and a file created more than 5 minutes after the last event is not treated as Session-created.',
         optSpills: 'Delete the Session’s spilled tool-output files',
         optSpillsHint: 'Clears the session-hash directories under dsh-spill roots that hold oversized tool results.',
         optImageCache: 'Also clear the attachment request cache',
@@ -283,6 +296,7 @@ window.__ModuleLoader__.load({
         noSpills: 'No spill directory was found for this Session.',
         logDir: 'Log directory',
         logFiles: 'Files: {names}',
+        logSizePartial: 'Log size may be a lower bound',
         conversationFolder: 'Conversation folder',
         conversationFolderSelected: 'whole folder will be deleted',
         conversationFolderKept: 'folder kept',
@@ -294,6 +308,7 @@ window.__ModuleLoader__.load({
         outsideWorkspace: 'Outside the workspace; kept',
         protectedItem: 'Protected; will not be deleted',
         missingFile: 'File no longer exists',
+        fileStatFailed: 'Could not read file metadata; kept',
         symlink: 'Symbolic link; will not be deleted',
         symlinkAncestor: 'Path crosses a symlink or junction; will not be deleted',
         referencesUnknown: 'Reference state unknown; kept',
@@ -303,6 +318,16 @@ window.__ModuleLoader__.load({
         fileOrigin: 'Origin: {origins}',
         createdDuring: 'Created during the Session',
         preExisting: 'Existed before the Session or creation time unknown',
+        fileTimeCreated: 'Created during the Session',
+        fileTimeBefore: 'Existed before the Session',
+        fileTimeAfter: 'Created or recreated after the Session',
+        fileTimeOutside: 'Outside the selected Session windows',
+        fileTimeUnknown: 'Creation time unknown',
+        sharedReasonsTitle: 'Used by',
+        selectedNow: 'Currently selected estimate',
+        selectAllLimit: 'At most {max} Sessions can be selected; the first {count} were selected.',
+        maxSessions: 'Select at most {max} Sessions.',
+        busyNote: 'Another cleanup task is running; wait for it to finish.',
         originWrite: 'write',
         originEdit: 'edit',
         originReplace: 'replace-edit',
@@ -690,9 +715,20 @@ window.__ModuleLoader__.load({
         const origins = (file.origins || [])
           .map((origin) => t(origin === 'write' ? 'originWrite' : origin === 'edit' ? 'originEdit' : origin === 'str_replace_editor' ? 'originReplace' : origin === 'present' ? 'originPresent' : 'originScan'))
           .join(' / ')
+        const timeLabel = file.timeEvidence === 'created-during'
+          ? t('fileTimeCreated')
+          : file.timeEvidence === 'before-session'
+            ? t('fileTimeBefore')
+            : file.timeEvidence === 'after-session'
+              ? t('fileTimeAfter')
+              : file.timeEvidence === 'outside-session'
+                ? t('fileTimeOutside')
+                : t('fileTimeUnknown')
         const reasonText = file.reasonCode === 'missing'
           ? t('missingFile')
-          : file.reasonCode === 'symlink'
+          : file.reasonCode === 'stat-failed'
+            ? t('fileStatFailed')
+            : file.reasonCode === 'symlink'
             ? t('symlink')
             : file.reasonCode === 'symlink-ancestor'
               ? t('symlinkAncestor')
@@ -722,7 +758,7 @@ window.__ModuleLoader__.load({
               [
                 formatBytes(file.sizeBytes),
                 t('fileOrigin', { origins }),
-                file.createdDuring ? t('createdDuring') : t('preExisting'),
+                timeLabel,
               ].join(' · '),
               file.outsideWorkspace ? previewBadge(t('outsideWorkspace'), STYLE.badgeWarn) : null,
               file.sharedWith && file.sharedWith.length > 0
@@ -798,11 +834,9 @@ window.__ModuleLoader__.load({
             ? t('symlinkAncestor')
             : folder.referencesUnknown
               ? t('referencesUnknown')
-              : folder.sharedWith && folder.sharedWith.length > 0
-                ? t('sharedWith', { count: folder.sharedWith.length })
-                : folder.metadataState === 'invalid'
-                  ? t('folderMetadataInvalid')
-                  : folder.reason
+              : props.mode === 'keepOut'
+                ? folder.keepOutReason
+                : folder.reason
         return h(
           'div',
           { style: { ...STYLE.row, ...(props.last ? STYLE.rowLast : {}) } },
@@ -887,6 +921,7 @@ window.__ModuleLoader__.load({
         const [phase, setPhase] = useState('loading')
         const [sessions, setSessions] = useState([])
         const [sortMode, setSortMode] = useState('size')
+        const [selectionNotice, setSelectionNotice] = useState(null)
         const [selected, setSelected] = useState(() => new Set())
         const [options, setOptions] = useState({
           conversationFolder: false,
@@ -973,6 +1008,7 @@ window.__ModuleLoader__.load({
           setConfirming(false)
           setDeleteError(null)
           setOpenError(null)
+          setSelectionNotice(null)
           try {
             const value = await callApi('list', {}, { signal: controller.signal, timeoutMs: 60000 })
             if (seq !== requestSeq.current) return
@@ -1070,6 +1106,11 @@ window.__ModuleLoader__.load({
         }
 
         const toggleSession = (id) => {
+          if (!selected.has(id) && selected.size >= MAX_SESSIONS) {
+            setSelectionNotice(t('maxSessions', { max: MAX_SESSIONS }))
+            return
+          }
+          setSelectionNotice(null)
           setSelected((previous) => {
             const next = new Set(previous)
             if (next.has(id)) next.delete(id)
@@ -1080,12 +1121,18 @@ window.__ModuleLoader__.load({
         }
 
         const selectAll = () => {
-          setSelected(new Set(sessions.filter((session) => session.live !== true).map((session) => session.id)))
+          const selectable = sortedSessions.filter((session) => session.live !== true)
+          const limited = selectable.slice(0, MAX_SESSIONS)
+          setSelected(new Set(limited.map((session) => session.id)))
+          setSelectionNotice(selectable.length > MAX_SESSIONS
+            ? t('selectAllLimit', { count: limited.length, max: MAX_SESSIONS })
+            : null)
           invalidatePreview()
         }
 
         const clearSelection = () => {
           setSelected(new Set())
+          setSelectionNotice(null)
           invalidatePreview()
         }
 
@@ -1095,7 +1142,11 @@ window.__ModuleLoader__.load({
         }
 
         const previewNow = async () => {
-          if (selected.size === 0) return
+          if (selected.size === 0 || deleting || folderDeleting) return
+          if (selected.size > MAX_SESSIONS) {
+            setPreviewError(t('maxSessions', { max: MAX_SESSIONS }))
+            return
+          }
           const seq = ++requestSeq.current
           previewAbort.current?.abort()
           const controller = new AbortController()
@@ -1134,13 +1185,13 @@ window.__ModuleLoader__.load({
         }
 
         const requestDelete = () => {
-          if (preview === null || previewToken === null || selected.size === 0 || deleting) return
+          if (preview === null || previewToken === null || selected.size === 0 || deleting || folderDeleting) return
           setConfirming(true)
           setDeleteError(null)
         }
 
         const deleteNow = async () => {
-          if (preview === null || previewToken === null || confirming !== true || deleting) return
+          if (preview === null || previewToken === null || confirming !== true || deleting || folderDeleting) return
           setDeleting(true)
           setDeleteError(null)
           try {
@@ -1168,7 +1219,7 @@ window.__ModuleLoader__.load({
             await loadFolders()
           } catch (error) {
             const message = messageOf(error)
-            if (error && (error.code === 'stale-preview' || error.code === 'preview-required')) {
+            if (error && ['stale-preview', 'preview-required', 'preview-consumed', 'preview-in-use'].includes(error.code)) {
               setPreview(null)
               setPreviewToken(null)
               setConfirming(false)
@@ -1244,6 +1295,7 @@ window.__ModuleLoader__.load({
             setFolderError(t('folderNoSelection'))
             return
           }
+          if (deleting || folderDeleting) return
           setFolderError(null)
           setFolderReport(null)
           setFolderConfirming(false)
@@ -1261,7 +1313,7 @@ window.__ModuleLoader__.load({
         }
 
         const folderDeleteNow = async () => {
-          if (folderPlan === null || folderToken === null || folderConfirming !== true || folderDeleting) return
+          if (folderPlan === null || folderToken === null || folderConfirming !== true || folderDeleting || deleting) return
           setFolderDeleting(true)
           setFolderError(null)
           try {
@@ -1276,7 +1328,7 @@ window.__ModuleLoader__.load({
             setFolderChoice(new Map())
             await loadFolders()
           } catch (error) {
-            if (error && (error.code === 'stale-preview' || error.code === 'folder-preview-required')) {
+            if (error && ['stale-preview', 'folder-preview-required', 'folder-preview-consumed', 'folder-preview-in-use'].includes(error.code)) {
               setFolderPlan(null)
               setFolderConfirming(false)
               setFolderChoice(new Map())
@@ -1299,6 +1351,21 @@ window.__ModuleLoader__.load({
           () => sessions.filter((session) => selected.has(session.id)).reduce((sum, session) => sum + (session.sizeBytes || 0), 0),
           [sessions, selected],
         )
+        const selectedPreviewBytes = useMemo(() => {
+          if (preview === null) return 0
+          const attachmentBytes = (preview.attachments || [])
+            .filter((attachment) => attachmentChoice.get(attachment.id) === true)
+            .reduce((sum, attachment) => sum + (attachment.bytes || 0), 0)
+          const fileBytes = (preview.files || [])
+            .filter((file) => fileChoice.get(file.path) === true)
+            .reduce((sum, file) => sum + (file.sizeBytes || 0), 0)
+          return (preview.totals.sessionBytes || 0) +
+            (preview.totals.projectionBytes || 0) +
+            (preview.totals.conversationBytes || 0) +
+            attachmentBytes +
+            fileBytes +
+            (preview.totals.spillBytes || 0)
+        }, [preview, attachmentChoice, fileChoice])
         const sortedSessions = useMemo(() => {
           const list = [...sessions]
           list.sort((left, right) => {
@@ -1318,7 +1385,7 @@ window.__ModuleLoader__.load({
           : showAllFiles
             ? preview.files || []
             : (preview.files || []).slice(0, FILE_PAGE)
-        const canDelete = preview !== null && previewToken !== null && selected.size > 0 && !deleting
+        const canDelete = preview !== null && previewToken !== null && selected.size > 0 && !deleting && !folderDeleting
 
         return h(
           'div',
@@ -1463,8 +1530,8 @@ window.__ModuleLoader__.load({
               'button',
               {
                 type: 'button',
-                style: { ...STYLE.button, ...STYLE.primary, ...(selected.size === 0 || previewing ? STYLE.disabled : {}) },
-                disabled: selected.size === 0 || previewing,
+                style: { ...STYLE.button, ...STYLE.primary, ...(selected.size === 0 || previewing || deleting || folderDeleting ? STYLE.disabled : {}) },
+                disabled: selected.size === 0 || previewing || deleting || folderDeleting,
                 onClick: previewNow,
               },
               previewing ? t('previewing') : t('preview'),
@@ -1473,6 +1540,9 @@ window.__ModuleLoader__.load({
             h('span', { style: STYLE.spacer }),
             h('span', { style: STYLE.meta }, t('totalSize', { size: formatBytes(sessions.reduce((sum, session) => sum + (session.sizeBytes || 0), 0)) })),
           ),
+
+          selectionNotice ? h('div', { style: STYLE.warn }, selectionNotice) : null,
+          deleting || folderDeleting ? h('div', { style: STYLE.meta }, t('busyNote')) : null,
 
           previewError
             ? h('div', { style: STYLE.error }, t('previewFailed', { message: previewError }))
@@ -1499,6 +1569,7 @@ window.__ModuleLoader__.load({
                 stat(t('fileBytes'), formatBytes(preview.totals.fileBytes)),
                 stat(t('spillBytes'), formatBytes(preview.totals.spillBytes || 0)),
                 stat(t('totalBytes'), formatBytes(preview.totals.totalBytes)),
+                stat(t('selectedNow'), formatBytes(selectedPreviewBytes)),
               ),
 
               h('h4', { style: STYLE.cardTitle }, t('sessionsSection')),
@@ -1515,7 +1586,8 @@ window.__ModuleLoader__.load({
                     ),
                     h('div', { style: STYLE.mono }, session.id),
                     session.logDir
-                      ? h('div', { style: STYLE.meta }, `${t('logDir')}: ${session.logDir} · ${formatBytes(session.logBytes)}`)
+                      ? h('div', { style: STYLE.meta }, `${t('logDir')}: ${session.logDir} · ${formatBytes(session.logBytes)}`,
+                          session.logSizeComplete === false ? previewBadge(t('logSizePartial'), STYLE.badgeWarn) : null)
                       : h('div', { style: STYLE.warn }, t('archiveOnly')),
                     session.projectionCache && session.projectionCache.exists
                       ? h('div', { style: STYLE.meta }, `${t('projectionCache')}: ${session.projectionCache.path} · ${formatBytes(session.projectionCache.bytes)}`)
@@ -1529,6 +1601,12 @@ window.__ModuleLoader__.load({
                       : null,
                     session.conversationFolder && session.conversationFolder.sharedWith && session.conversationFolder.sharedWith.length > 0
                       ? previewBadge(t('sharedWith', { count: session.conversationFolder.sharedWith.length }), STYLE.badgeWarn)
+                      : null,
+                    session.conversationFolder && (session.conversationFolder.sharedReasons || []).length > 0
+                      ? h('div', { style: STYLE.mono },
+                          `${t('sharedReasonsTitle')}: ${session.conversationFolder.sharedReasons
+                            .map((item) => `${item.id} (${item.reasons.join(', ')})`)
+                            .join(' · ')}`)
                       : null,
                     session.conversationFolder && session.conversationFolder.referencesUnknown
                       ? previewBadge(t('referencesUnknown'), STYLE.badgeWarn)
@@ -1661,8 +1739,8 @@ window.__ModuleLoader__.load({
                             'button',
                             {
                               type: 'button',
-                              style: { ...STYLE.button, ...STYLE.danger, ...(deleting ? STYLE.disabled : {}) },
-                              disabled: deleting,
+                              style: { ...STYLE.button, ...STYLE.danger, ...(deleting || folderDeleting ? STYLE.disabled : {}) },
+                              disabled: deleting || folderDeleting,
                               onClick: deleteNow,
                             },
                             deleting ? t('deleting') : t('confirmButton'),
@@ -1672,8 +1750,8 @@ window.__ModuleLoader__.load({
                             {
                               type: 'button',
                               autoFocus: true,
-                              style: { ...STYLE.button, ...(deleting ? STYLE.disabled : {}) },
-                              disabled: deleting,
+                              style: { ...STYLE.button, ...((deleting || folderDeleting) ? STYLE.disabled : {}) },
+                              disabled: deleting || folderDeleting,
                               onClick: cancelDelete,
                             },
                             t('cancel'),
@@ -1745,8 +1823,8 @@ window.__ModuleLoader__.load({
                   'button',
                   {
                     type: 'button',
-                    style: { ...STYLE.button, ...STYLE.primary, ...(selectedFolders.length === 0 || folderDeleting ? STYLE.disabled : {}) },
-                    disabled: selectedFolders.length === 0 || folderDeleting,
+                    style: { ...STYLE.button, ...STYLE.primary, ...(selectedFolders.length === 0 || folderDeleting || deleting ? STYLE.disabled : {}) },
+                    disabled: selectedFolders.length === 0 || folderDeleting || deleting,
                     onClick: previewFoldersNow,
                   },
                   t('folderPreview'),
@@ -1776,14 +1854,14 @@ window.__ModuleLoader__.load({
                           { style: { ...STYLE.confirmRow, marginTop: 10 } },
                           h('button', {
                             type: 'button',
-                            style: { ...STYLE.button, ...STYLE.danger, ...(folderDeleting ? STYLE.disabled : {}) },
-                            disabled: folderDeleting,
+                            style: { ...STYLE.button, ...STYLE.danger, ...(folderDeleting || deleting ? STYLE.disabled : {}) },
+                            disabled: folderDeleting || deleting,
                             onClick: folderDeleteNow,
                           }, folderDeleting ? t('folderDeleting') : t('folderConfirm')),
                           h('button', {
                             type: 'button',
-                            style: { ...STYLE.button, ...(folderDeleting ? STYLE.disabled : {}) },
-                            disabled: folderDeleting,
+                            style: { ...STYLE.button, ...(folderDeleting || deleting ? STYLE.disabled : {}) },
+                            disabled: folderDeleting || deleting,
                             onClick: cancelFolderDelete,
                           }, t('cancel')),
                         )
@@ -1792,7 +1870,8 @@ window.__ModuleLoader__.load({
                           { style: { ...STYLE.confirmRow, marginTop: 10 } },
                           h('button', {
                             type: 'button',
-                            style: { ...STYLE.button, ...STYLE.dangerGhost },
+                            style: { ...STYLE.button, ...STYLE.dangerGhost, ...(folderDeleting || deleting ? STYLE.disabled : {}) },
+                            disabled: folderDeleting || deleting,
                             onClick: () => setFolderConfirming(true),
                           }, t('folderDelete')),
                           h('button', {

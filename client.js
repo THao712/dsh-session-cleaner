@@ -16,6 +16,8 @@ window.__ModuleLoader__.load({
     const NS = 'session-cleaner'
     const ROUTE = '/dsh-session-cleaner/api'
     const FILE_PAGE = 80
+    const SESSION_PAGE = 100
+    const FOLDER_PAGE = 100
     const MAX_SESSIONS = 200
 
     const DICTIONARIES = {
@@ -184,6 +186,8 @@ window.__ModuleLoader__.load({
         clearAttachments: '清空附件',
         showAll: '显示全部 {count} 项',
         showLess: '收起',
+        showMoreSessions: '显示更多会话（剩余 {count} 个）',
+        showMoreFolders: '显示更多目录（剩余 {count} 个）',
         totals: '合计',
         sessionBytes: '会话日志',
         projectionBytes: '投影检查点',
@@ -382,6 +386,8 @@ window.__ModuleLoader__.load({
         clearAttachments: 'Clear attachments',
         showAll: 'Show all {count}',
         showLess: 'Show less',
+        showMoreSessions: 'Show more Sessions ({count} remaining)',
+        showMoreFolders: 'Show more folders ({count} remaining)',
         totals: 'Totals',
         sessionBytes: 'Session logs',
         projectionBytes: 'Checkpoints',
@@ -958,6 +964,8 @@ window.__ModuleLoader__.load({
         const [sessions, setSessions] = useState([])
         const [sortMode, setSortMode] = useState('size')
         const [search, setSearch] = useState('')
+        const [sessionLimit, setSessionLimit] = useState(SESSION_PAGE)
+        const [folderLimit, setFolderLimit] = useState(FOLDER_PAGE)
         const [selectionNotice, setSelectionNotice] = useState(null)
         const [lastRun, setLastRun] = useState(null)
         const [selected, setSelected] = useState(() => new Set())
@@ -1011,6 +1019,7 @@ window.__ModuleLoader__.load({
             if (seq !== folderSeq.current) return
             const list = Array.isArray(value.folders) ? value.folders : []
             setFolders(list)
+            setFolderLimit(FOLDER_PAGE)
             setFolderToken(typeof value.previewToken === 'string' ? value.previewToken : null)
             setFolderChoice((previous) => {
               const next = new Map()
@@ -1061,6 +1070,7 @@ window.__ModuleLoader__.load({
             if (seq !== requestSeq.current) return
             const list = Array.isArray(value.sessions) ? value.sessions : []
             setSessions(list)
+            setSessionLimit(SESSION_PAGE)
             setSelected((previous) => {
               const next = new Set()
               for (const id of previous) {
@@ -1314,6 +1324,7 @@ window.__ModuleLoader__.load({
           () => folders.filter((folder) => folderChoice.has(folder.key)),
           [folders, folderChoice],
         )
+        const displayFolders = folders.slice(0, folderLimit)
         const folderFreedBytes = useMemo(
           () => selectedFolders.reduce((sum, folder) => {
             const mode = folderChoice.get(folder.key)
@@ -1467,6 +1478,7 @@ window.__ModuleLoader__.load({
             return fields.some((field) => typeof field === 'string' && field.toLowerCase().includes(query))
           })
         }, [sortedSessions, search])
+        const displaySessions = visibleSessions.slice(0, sessionLimit)
         const displayFiles = preview === null
           ? []
           : showAllFiles
@@ -1600,7 +1612,7 @@ window.__ModuleLoader__.load({
                       : h(
                           'div',
                           { style: STYLE.list },
-                          visibleSessions.map((session, index) =>
+                          displaySessions.map((session, index) =>
                             h(SessionRow, {
                               key: session.id,
                               session,
@@ -1609,10 +1621,17 @@ window.__ModuleLoader__.load({
                               onOpen: openWorkspace,
                               opening: openingId === session.id,
                               error: openError && openError.id === session.id ? openError.message : null,
-                              last: index === visibleSessions.length - 1,
+                              last: index === displaySessions.length - 1,
                             }),
                           ),
                         ),
+              visibleSessions.length > displaySessions.length
+                ? h('button', {
+                    type: 'button',
+                    style: { ...STYLE.button, marginTop: 8 },
+                    onClick: () => setSessionLimit((value) => value + SESSION_PAGE),
+                  }, t('showMoreSessions', { count: visibleSessions.length - displaySessions.length }))
+                : null,
             ),
           ),
 
@@ -1959,15 +1978,22 @@ window.__ModuleLoader__.load({
                       : h(
                           'div',
                           { style: STYLE.list },
-                          folders.map((folder, index) => h(FolderRow, {
+                          displayFolders.map((folder, index) => h(FolderRow, {
                             key: folder.key,
                             folder,
                             mode: folderChoice.get(folder.key) ?? null,
                             onToggle: toggleFolder,
                             onMode: setFolderMode,
-                            last: index === folders.length - 1,
+                            last: index === displayFolders.length - 1,
                           })),
                         ),
+              folders.length > displayFolders.length
+                ? h('button', {
+                    type: 'button',
+                    style: { ...STYLE.button, marginTop: 8 },
+                    onClick: () => setFolderLimit((value) => value + FOLDER_PAGE),
+                  }, t('showMoreFolders', { count: folders.length - displayFolders.length }))
+                : null,
               h(
                 'div',
                 { style: { ...STYLE.actions, marginTop: 10 } },

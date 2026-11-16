@@ -33,6 +33,11 @@ window.__ModuleLoader__.load({
         clear: '清空',
         selected: '已选 {count} 个会话',
         totalSize: '列表合计 {size}',
+        sortLabel: '排序',
+        sortTime: '按时间',
+        sortSize: '按大小',
+        sortTimeHint: '按会话创建时间从新到旧排列。',
+        sortSizeHint: '按会话日志大小从大到小排列；日志缺失或大小未知的会话排在最后。',
         live: '运行中',
         opened: '已打开',
         missing: '日志缺失',
@@ -196,6 +201,11 @@ window.__ModuleLoader__.load({
         clear: 'Clear',
         selected: '{count} Sessions selected',
         totalSize: '{size} in the list',
+        sortLabel: 'Sort',
+        sortTime: 'Newest',
+        sortSize: 'Largest',
+        sortTimeHint: 'Newest Sessions first.',
+        sortSizeHint: 'Largest Session logs first; missing or unknown sizes go last.',
         live: 'Live',
         opened: 'Open',
         missing: 'Log missing',
@@ -876,6 +886,7 @@ window.__ModuleLoader__.load({
       function CleanupPage() {
         const [phase, setPhase] = useState('loading')
         const [sessions, setSessions] = useState([])
+        const [sortMode, setSortMode] = useState('size')
         const [selected, setSelected] = useState(() => new Set())
         const [options, setOptions] = useState({
           conversationFolder: false,
@@ -1288,6 +1299,20 @@ window.__ModuleLoader__.load({
           () => sessions.filter((session) => selected.has(session.id)).reduce((sum, session) => sum + (session.sizeBytes || 0), 0),
           [sessions, selected],
         )
+        const sortedSessions = useMemo(() => {
+          const list = [...sessions]
+          list.sort((left, right) => {
+            if (left.missing !== right.missing) return left.missing ? 1 : -1
+            if (sortMode === 'size') {
+              const sizeDiff = (right.sizeBytes || 0) - (left.sizeBytes || 0)
+              if (sizeDiff !== 0) return sizeDiff
+            }
+            const createdDiff = (right.createdAt || 0) - (left.createdAt || 0)
+            if (createdDiff !== 0) return createdDiff
+            return String(left.id).localeCompare(String(right.id))
+          })
+          return list
+        }, [sessions, sortMode])
         const displayFiles = preview === null
           ? []
           : showAllFiles
@@ -1317,6 +1342,29 @@ window.__ModuleLoader__.load({
               h(
                 'div',
                 { style: STYLE.inline },
+                h('span', { style: STYLE.meta }, t('sortLabel')),
+                h(
+                  'button',
+                  {
+                    type: 'button',
+                    title: t('sortTimeHint'),
+                    'aria-pressed': sortMode === 'time',
+                    style: { ...STYLE.button, ...(sortMode === 'time' ? STYLE.primary : {}) },
+                    onClick: () => setSortMode('time'),
+                  },
+                  t('sortTime'),
+                ),
+                h(
+                  'button',
+                  {
+                    type: 'button',
+                    title: t('sortSizeHint'),
+                    'aria-pressed': sortMode === 'size',
+                    style: { ...STYLE.button, ...(sortMode === 'size' ? STYLE.primary : {}) },
+                    onClick: () => setSortMode('size'),
+                  },
+                  t('sortSize'),
+                ),
                 h('button', { type: 'button', style: STYLE.button, onClick: selectAll, disabled: sessions.length === 0 }, t('selectAll')),
                 h('button', { type: 'button', style: STYLE.button, onClick: clearSelection, disabled: selected.size === 0 }, t('clear')),
                 h('button', { type: 'button', style: STYLE.button, onClick: load }, t('refresh')),
@@ -1337,7 +1385,7 @@ window.__ModuleLoader__.load({
                     : h(
                         'div',
                         { style: STYLE.list },
-                        sessions.map((session, index) =>
+                        sortedSessions.map((session, index) =>
                           h(SessionRow, {
                             key: session.id,
                             session,
@@ -1346,7 +1394,7 @@ window.__ModuleLoader__.load({
                             onOpen: openWorkspace,
                             opening: openingId === session.id,
                             error: openError && openError.id === session.id ? openError.message : null,
-                            last: index === sessions.length - 1,
+                            last: index === sortedSessions.length - 1,
                           }),
                         ),
                       ),

@@ -1,6 +1,6 @@
 {
   "name": "dsh-session-cleaner-thao712",
-  "version": "1.5.0",
+  "version": "1.6.0",
   "type": "module",
   "description": "Preview and permanently delete archived DeepSeek Harness Sessions, per-conversation folders, attachments, workspace files, and orphan conversation folders.",
   "license": "MIT",

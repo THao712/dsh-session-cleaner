@@ -961,7 +961,14 @@ window.__ModuleLoader__.load({
                 )
               : null,
             reasonText ? h('div', { style: STYLE.warn }, reasonText) : null,
+            props.error ? h('div', { style: { ...STYLE.error, marginTop: 2 } }, props.error) : null,
           ),
+          h(FolderButton, {
+            disabled: typeof folder.path !== 'string' || folder.path.length === 0,
+            busy: props.opening === true,
+            title: `${t('openWorkspace')}${folder.workspaceTitle ? ` · ${folder.workspaceTitle}` : ''}`,
+            onClick: () => props.onOpen(folder),
+          }),
         )
       }
 
@@ -1111,6 +1118,33 @@ window.__ModuleLoader__.load({
           const timer = setInterval(() => { void loadJournal() }, 3000)
           return () => clearInterval(timer)
         }, [lastRun, loadJournal])
+
+        const openFolderPath = async (folder) => {
+          const id = folder.key
+          setOpeningId(id)
+          setOpenError(null)
+          let lastMessage = t('openWorkspaceFailed', { message: 'open failed' })
+          try {
+            const sessionRemote = ctx.remote && ctx.remote.session
+            if (sessionRemote === undefined || typeof sessionRemote.openWorkspacePath !== 'function') {
+              lastMessage = t('openWorkspaceFailed', { message: 'the session Remote is unavailable' })
+            } else if (typeof folder.path !== 'string' || folder.path.length === 0) {
+              lastMessage = t('noWorkspacePath')
+            } else {
+              const result = await sessionRemote.openWorkspacePath({ path: folder.path }, new AbortController().signal)
+              if (result && result.ok === false) {
+                lastMessage = result.error && result.error.message ? result.error.message : lastMessage
+              } else if ((result && result.ok === true) || (result && result.opened === true)) {
+                return
+              }
+            }
+            setOpenError({ id, message: lastMessage })
+          } catch (error) {
+            setOpenError({ id, message: error instanceof Error ? error.message : String(error) })
+          } finally {
+            setOpeningId(null)
+          }
+        }
 
         const openWorkspace = async (session) => {
           setOpeningId(session.id)
@@ -2002,6 +2036,9 @@ window.__ModuleLoader__.load({
                             mode: folderChoice.get(folder.key) ?? null,
                             onToggle: toggleFolder,
                             onMode: setFolderMode,
+                            onOpen: openFolderPath,
+                            opening: openingId === folder.key,
+                            error: openError && openError.id === folder.key ? openError.message : null,
                             last: index === displayFolders.length - 1,
                           })),
                         ),

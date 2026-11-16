@@ -155,11 +155,14 @@ window.__ModuleLoader__.load({
         maxSessions: '单次最多选择 {max} 个会话。',
         busyNote: '另一个清理任务正在执行，请等待完成。',
         lastRunTitle: '上次清理任务',
+        lastRunRunning: '清理任务正在执行',
         lastRunInterrupted: '上次清理在完成前中断',
         lastRunPartial: '上次清理部分完成',
         lastRunInfo: '任务 {id} · 已处理 {completed}/{total} 个会话 · 失败 {failed} · 待收尾 {pending}',
         lastRunPhase: '最后阶段：{phase}',
         lastRunHint: '插件不会自动重放中断的删除。请重新勾选并预览；已经删除的资源会显示为缺失或跳过。',
+        lastRunRunningHint: '页面请求可能已超时，Host 仍可能在执行。刷新任务状态不会重复删除。',
+        lastRunRefresh: '刷新任务状态',
         lastRunRepreview: '重新预览剩余会话',
         lastRunNothing: '没有剩余会话需要重新预览。',
         lastRunDismiss: '隐藏',
@@ -355,11 +358,14 @@ window.__ModuleLoader__.load({
         maxSessions: 'Select at most {max} Sessions.',
         busyNote: 'Another cleanup task is running; wait for it to finish.',
         lastRunTitle: 'Previous cleanup task',
+        lastRunRunning: 'Cleanup task is running',
         lastRunInterrupted: 'The previous cleanup was interrupted',
         lastRunPartial: 'The previous cleanup partially completed',
         lastRunInfo: 'Task {id} · {completed}/{total} Sessions processed · {failed} failed · {pending} deferred',
         lastRunPhase: 'Last phase: {phase}',
         lastRunHint: 'The plugin does not automatically replay an interrupted deletion. Select and preview again; resources that were already removed will appear as missing or skipped.',
+        lastRunRunningHint: 'The page request may have timed out while the Host continues. Refreshing the task status does not delete anything again.',
+        lastRunRefresh: 'Refresh task status',
         lastRunRepreview: 'Preview remaining Sessions',
         lastRunNothing: 'No remaining Sessions to preview.',
         lastRunDismiss: 'Dismiss',
@@ -1310,6 +1316,9 @@ window.__ModuleLoader__.load({
               setPreviewError(t('stalePreview'))
             }
             setDeleteError(message)
+            if (error && (error.name === 'AbortError' || error.name === 'TimeoutError')) {
+              await loadJournal()
+            }
           } finally {
             setDeleting(false)
           }
@@ -1496,9 +1505,11 @@ window.__ModuleLoader__.load({
                 : lastRun.phase === 'done'
                   ? t('phaseDone')
                   : t('phaseUnknown')
-        const lastRunLabel = lastRun !== null && lastRun.status === 'interrupted'
-          ? t('lastRunInterrupted')
-          : t('lastRunPartial')
+        const lastRunLabel = lastRun !== null && lastRun.status === 'running'
+          ? t('lastRunRunning')
+          : lastRun !== null && lastRun.status === 'interrupted'
+            ? t('lastRunInterrupted')
+            : t('lastRunPartial')
 
         return h(
           'div',
@@ -1512,7 +1523,7 @@ window.__ModuleLoader__.load({
             h('p', { style: STYLE.meta }, t('openNote')),
           ),
 
-          lastRun !== null && (lastRun.status === 'interrupted' || lastRun.status === 'partial')
+          lastRun !== null && (lastRun.status === 'running' || lastRun.status === 'interrupted' || lastRun.status === 'partial')
             ? h(
                 'section',
                 { style: { ...STYLE.card, borderColor: 'var(--dsw-alias-state-warn-primary)' } },
@@ -1527,8 +1538,8 @@ window.__ModuleLoader__.load({
                       type: 'button',
                       style: { ...STYLE.button, ...(previewing || deleting || folderDeleting ? STYLE.disabled : {}) },
                       disabled: previewing || deleting || folderDeleting,
-                      onClick: resumeLastRun,
-                    }, t('lastRunRepreview')),
+                      onClick: lastRun.status === 'running' ? loadJournal : resumeLastRun,
+                    }, lastRun.status === 'running' ? t('lastRunRefresh') : t('lastRunRepreview')),
                     h('button', { type: 'button', style: STYLE.button, onClick: () => setLastRun(null) }, t('lastRunDismiss')),
                   ),
                 ),
@@ -1545,6 +1556,7 @@ window.__ModuleLoader__.load({
                   })),
                   h('p', { style: STYLE.meta }, t('lastRunPhase', { phase: lastRunPhase })),
                   lastRun.status === 'interrupted' ? h('p', { style: STYLE.meta }, t('lastRunHint')) : null,
+                  lastRun.status === 'running' ? h('p', { style: STYLE.meta }, t('lastRunRunningHint')) : null,
                 ),
               )
             : null,

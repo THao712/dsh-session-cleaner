@@ -36,7 +36,7 @@ A DeepSeek Harness plugin that previews and permanently deletes archived Session
 - 工作区文件默认不勾选：工作区之外的文件、仍被其他会话引用的文件、会话开始前已存在的文件（例如被 `edit` 的既有源码）；前两类即使手动勾选也不会被 Host 接受。默认勾选只针对可由创建时间证明“会话期间新建”且来源为 `write` / `str_replace_editor` 的文件；`edit` / `present` / 扫描结果需要手动确认。文件创建时间晚于会话最后事件 5 分钟后，不再算作会话期间新建。
 - 删除前需要两次点击确认（“永久删除所选内容” → “确认永久删除”）；操作不可撤销。
 - 驻留会话的收尾：文件删除成功后，插件把会话 ID 写入 `<DSH_HOME>/session-cleaner-pending.json`，保留工作区记账与归档标记直到下一次启动；启动时 `finalizePending()` 再 detach/unarchive/unpin。detach、unarchive 或 unpin 失败的普通会话也会写入 pending，下次启动重试，不再只留下警告。这样既不需要为了删除而重启，也不会产生“未分组”幽灵。
-- 每次会话清理都会在首个不可逆操作前写入 `<DSH_HOME>/session-cleaner-journal.json`，记录任务 ID、已确认的会话/选项、预览指纹摘要、当前阶段、已处理/失败/待收尾会话和最终报告摘要。进程中断后，下次启动会把 `running` 记录标记为 `interrupted`，并对 journal 中已完成日志删除的会话只恢复 detach/unarchive/unpin 记账；不会自动重放文件/附件/目录删除。设置页会显示上次任务，并提供“重新预览剩余会话”，恢复删除仍需重新预览确认。
+- 每次会话清理都会在首个不可逆操作前写入 `<DSH_HOME>/session-cleaner-journal.json`，记录任务 ID、已确认的会话/选项、预览指纹摘要、当前阶段、已处理/失败/待收尾会话和最终报告摘要。进程中断后，下次启动会把 `running` 记录标记为 `interrupted`，并对 journal 中已完成日志删除的会话只恢复 detach/unarchive/unpin 记账；不会自动重放文件/附件/目录删除。设置页会显示上次任务，并提供“重新预览剩余会话”，恢复删除仍需重新预览确认。若 Client 请求超时但 Host 仍在执行，可显示运行中任务并刷新状态，不会重复提交删除。
 - 目录统计与递归清单在同一次遍历中完成；扫描受条目预算限制，超限、权限不足或读取失败会显示为“不完整”，整目录删除会被阻止，而不是把部分大小当作完整大小。
 
 ## 安装

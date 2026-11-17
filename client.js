@@ -166,9 +166,16 @@ window.__ModuleLoader__.load({
         lastRunRepreview: '重新预览剩余会话',
         lastRunNothing: '没有剩余会话需要重新预览。',
         lastRunDismiss: '隐藏',
+        lastRunFolderInfo: '任务 {id} · 目录 {requested} 个 · 删除 {removed} · 保留 out {keptOut} · 跳过 {skipped}',
+        lastRunFolderRefresh: '刷新目录列表',
+        lastRunFolderHint: '目录清理不会自动重放。目录列表已刷新，请重新选择需要处理的目录。',
+        lastRunResources: '仍有 {count} 个已选资源未清理，可使用“重新预览剩余会话”检查。',
+        pendingConflictsTitle: '需要人工检查的会话',
+        pendingConflictsInfo: '以下会话的日志重新出现，插件未执行延迟收尾：{ids}',
         phaseLogs: '会话日志',
         phaseBookkeeping: '归档记账',
         phaseArtifacts: '附件/文件',
+        phaseFolders: '目录清理',
         phaseDone: '已完成',
         phaseUnknown: '未知',
         originWrite: '写入',
@@ -176,6 +183,7 @@ window.__ModuleLoader__.load({
         originReplace: '替换编辑',
         originPresent: '交付',
         originScan: '扫描',
+        originRecovered: '上次未完成',
         attachmentImage: '图片',
         attachmentFile: '文件',
         attachmentUnknown: '附件',
@@ -369,9 +377,16 @@ window.__ModuleLoader__.load({
         lastRunRepreview: 'Preview remaining Sessions',
         lastRunNothing: 'No remaining Sessions to preview.',
         lastRunDismiss: 'Dismiss',
+        lastRunFolderInfo: 'Task {id} · {requested} folder(s) · removed {removed} · kept out {keptOut} · skipped {skipped}',
+        lastRunFolderRefresh: 'Refresh folder list',
+        lastRunFolderHint: 'Folder cleanup is not replayed automatically. The folder list was refreshed; select the folders to process again.',
+        lastRunResources: '{count} selected resource(s) were not cleaned; use “Preview remaining Sessions” to inspect them.',
+        pendingConflictsTitle: 'Sessions that need review',
+        pendingConflictsInfo: 'The log of these Sessions exists again; deferred bookkeeping was not applied: {ids}',
         phaseLogs: 'Session logs',
         phaseBookkeeping: 'Archive bookkeeping',
         phaseArtifacts: 'Attachments/files',
+        phaseFolders: 'Folder cleanup',
         phaseDone: 'Done',
         phaseUnknown: 'Unknown',
         originWrite: 'write',
@@ -379,6 +394,7 @@ window.__ModuleLoader__.load({
         originReplace: 'replace-edit',
         originPresent: 'present',
         originScan: 'scan',
+        originRecovered: 'recovered',
         attachmentImage: 'Image',
         attachmentFile: 'File',
         attachmentUnknown: 'Attachment',
@@ -761,7 +777,7 @@ window.__ModuleLoader__.load({
             !(file.sharedWith && file.sharedWith.length > 0)
         const disabled = !deletable
         const origins = (file.origins || [])
-          .map((origin) => t(origin === 'write' ? 'originWrite' : origin === 'edit' ? 'originEdit' : origin === 'str_replace_editor' ? 'originReplace' : origin === 'present' ? 'originPresent' : 'originScan'))
+          .map((origin) => t(origin === 'write' ? 'originWrite' : origin === 'edit' ? 'originEdit' : origin === 'str_replace_editor' ? 'originReplace' : origin === 'present' ? 'originPresent' : origin === 'recovered' ? 'originRecovered' : 'originScan'))
           .join(' / ')
         const timeLabel = file.timeEvidence === 'created-during'
           ? t('fileTimeCreated')
@@ -981,6 +997,8 @@ window.__ModuleLoader__.load({
         const [folderLimit, setFolderLimit] = useState(FOLDER_PAGE)
         const [selectionNotice, setSelectionNotice] = useState(null)
         const [lastRun, setLastRun] = useState(null)
+        const [pendingConflicts, setPendingConflicts] = useState([])
+        const deleteRequestId = useRef(null)
         const [selected, setSelected] = useState(() => new Set())
         const [options, setOptions] = useState({
           conversationFolder: false,
@@ -1051,12 +1069,15 @@ window.__ModuleLoader__.load({
           }
         }, [])
 
-        const loadJournal = useCallback(async () => {
+        const loadJournal = useCallback(async (requestId) => {
           try {
-            const value = await callApi('journal', {}, { timeoutMs: 30000 })
+            const payload = typeof requestId === 'string' && requestId.length > 0 ? { requestId } : {}
+            const value = await callApi('journal', payload, { timeoutMs: 30000 })
             setLastRun(value && value.journal ? value.journal : null)
+            setPendingConflicts(Array.isArray(value?.conflicts) ? value.conflicts : [])
           } catch {
             setLastRun(null)
+            setPendingConflicts([])
           }
         }, [])
 
@@ -1291,8 +1312,17 @@ window.__ModuleLoader__.load({
 
         const resumeLastRun = async () => {
           if (lastRun === null) return
+          if (lastRun.kind === 'folders') {
+            setSelectionNotice(t('lastRunFolderHint'))
+            await loadFolders()
+            await loadJournal()
+            return
+          }
           const completed = new Set(lastRun.completedSessions || [])
-          const ids = [...new Set((lastRun.ids || []).filter((id) => typeof id === 'string' && !completed.has(id)))]
+          const ids = [...new Set((Array.isArray(lastRun.resumeIds) && lastRun.resumeIds.length > 0
+            ? lastRun.resumeIds
+            : (lastRun.ids || []))
+            .filter((id) => typeof id === 'string' && !completed.has(id)))]
           if (ids.length === 0) {
             setSelectionNotice(t('lastRunNothing'))
             return
@@ -1323,12 +1353,15 @@ window.__ModuleLoader__.load({
           if (preview === null || previewToken === null || confirming !== true || deleting || folderDeleting) return
           setDeleting(true)
           setDeleteError(null)
+          const requestId = `cleanup-${Date.now()}-${Math.random().toString(16).slice(2)}`
+          deleteRequestId.current = requestId
           try {
             const value = await callApi('delete', {
               ids: [...selected],
               options,
               previewToken,
               confirmed: true,
+              requestId,
               files: [...fileChoice.entries()].filter(([, checked]) => checked).map(([path]) => path),
               attachments: [...attachmentChoice.entries()].filter(([, checked]) => checked).map(([id]) => id),
             }, { timeoutMs: 900000 })
@@ -1357,7 +1390,7 @@ window.__ModuleLoader__.load({
             }
             setDeleteError(message)
             if (error && (error.name === 'AbortError' || error.name === 'TimeoutError')) {
-              await loadJournal()
+              await loadJournal(requestId)
             }
           } finally {
             setDeleting(false)
@@ -1450,10 +1483,12 @@ window.__ModuleLoader__.load({
           if (folderPlan === null || folderToken === null || folderConfirming !== true || folderDeleting || deleting) return
           setFolderDeleting(true)
           setFolderError(null)
+          const requestId = `folders-${Date.now()}-${Math.random().toString(16).slice(2)}`
           try {
             const value = await callApi('folders-delete', {
               previewToken: folderToken,
               confirmed: true,
+              requestId,
               folders: folderPlan.rows.map((row) => ({ key: row.key, mode: row.mode })),
             }, { timeoutMs: 900000 })
             setFolderReport(value)
@@ -1461,6 +1496,7 @@ window.__ModuleLoader__.load({
             setFolderConfirming(false)
             setFolderChoice(new Map())
             await loadFolders()
+            await loadJournal()
           } catch (error) {
             if (error && ['stale-preview', 'folder-preview-required', 'folder-preview-consumed', 'folder-preview-in-use'].includes(error.code)) {
               setFolderPlan(null)
@@ -1470,6 +1506,9 @@ window.__ModuleLoader__.load({
               await loadFolders()
             } else {
               setFolderError(messageOf(error))
+              if (error && (error.name === 'AbortError' || error.name === 'TimeoutError')) {
+                await loadJournal(requestId)
+              }
             }
           } finally {
             setFolderDeleting(false)
@@ -1534,6 +1573,10 @@ window.__ModuleLoader__.load({
             ? preview.files || []
             : (preview.files || []).slice(0, FILE_PAGE)
         const canDelete = preview !== null && previewToken !== null && selected.size > 0 && !deleting && !folderDeleting
+        const lastRunIsFolders = lastRun !== null && lastRun.kind === 'folders'
+        const lastRunFailedResources = lastRun === null
+          ? 0
+          : (lastRun.resources || []).filter((resource) => resource.status === 'failed').length
         const lastRunPhase = lastRun === null
           ? ''
           : lastRun.phase === 'logs'
@@ -1542,9 +1585,11 @@ window.__ModuleLoader__.load({
               ? t('phaseBookkeeping')
               : lastRun.phase === 'artifacts'
                 ? t('phaseArtifacts')
-                : lastRun.phase === 'done'
-                  ? t('phaseDone')
-                  : t('phaseUnknown')
+                : lastRun.phase === 'folders'
+                  ? t('phaseFolders')
+                  : lastRun.phase === 'done'
+                    ? t('phaseDone')
+                    : t('phaseUnknown')
         const lastRunLabel = lastRun !== null && lastRun.status === 'running'
           ? t('lastRunRunning')
           : lastRun !== null && lastRun.status === 'interrupted'
@@ -1578,8 +1623,10 @@ window.__ModuleLoader__.load({
                       type: 'button',
                       style: { ...STYLE.button, ...(previewing || deleting || folderDeleting ? STYLE.disabled : {}) },
                       disabled: previewing || deleting || folderDeleting,
-                      onClick: lastRun.status === 'running' ? loadJournal : resumeLastRun,
-                    }, lastRun.status === 'running' ? t('lastRunRefresh') : t('lastRunRepreview')),
+                      onClick: lastRun.status === 'running' ? () => loadJournal() : resumeLastRun,
+                    }, lastRun.status === 'running'
+                      ? t('lastRunRefresh')
+                      : lastRunIsFolders ? t('lastRunFolderRefresh') : t('lastRunRepreview')),
                     h('button', { type: 'button', style: STYLE.button, onClick: () => setLastRun(null) }, t('lastRunDismiss')),
                   ),
                 ),
@@ -1587,16 +1634,42 @@ window.__ModuleLoader__.load({
                   'div',
                   { style: STYLE.cardBody },
                   h('p', { style: STYLE.warn }, lastRunLabel),
-                  h('p', { style: STYLE.meta }, t('lastRunInfo', {
-                    id: lastRun.id ?? '—',
-                    completed: (lastRun.completedSessions || []).length,
-                    total: (lastRun.ids || []).length,
-                    failed: (lastRun.failedSessions || []).length,
-                    pending: (lastRun.pending || []).length,
-                  })),
+                  lastRunIsFolders
+                    ? h('p', { style: STYLE.meta }, t('lastRunFolderInfo', {
+                      id: lastRun.id ?? '—',
+                      requested: lastRun.summary?.requested ?? (lastRun.folders || []).length,
+                      removed: lastRun.summary?.removed ?? 0,
+                      keptOut: lastRun.summary?.keptOut ?? 0,
+                      skipped: lastRun.summary?.skipped ?? 0,
+                    }))
+                    : h('p', { style: STYLE.meta }, t('lastRunInfo', {
+                      id: lastRun.id ?? '—',
+                      completed: (lastRun.completedSessions || []).length,
+                      total: (lastRun.ids || []).length,
+                      failed: (lastRun.failedSessions || []).length,
+                      pending: (lastRun.pending || []).length,
+                    })),
                   h('p', { style: STYLE.meta }, t('lastRunPhase', { phase: lastRunPhase })),
+                  lastRunFailedResources > 0
+                    ? h('p', { style: STYLE.meta }, t('lastRunResources', { count: lastRunFailedResources }))
+                    : null,
                   lastRun.status === 'interrupted' ? h('p', { style: STYLE.meta }, t('lastRunHint')) : null,
                   lastRun.status === 'running' ? h('p', { style: STYLE.meta }, t('lastRunRunningHint')) : null,
+                ),
+              )
+            : null,
+
+          pendingConflicts.length > 0
+            ? h(
+                'section',
+                { style: { ...STYLE.card, borderColor: 'var(--dsw-alias-state-warn-primary)' } },
+                h('div', { style: STYLE.cardHead }, h('h3', { style: STYLE.cardTitle }, t('pendingConflictsTitle'))),
+                h(
+                  'div',
+                  { style: STYLE.cardBody },
+                  h('p', { style: STYLE.meta }, t('pendingConflictsInfo', {
+                    ids: pendingConflicts.map((entry) => entry.id).join(', '),
+                  })),
                 ),
               )
             : null,

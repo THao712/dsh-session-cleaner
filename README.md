@@ -29,15 +29,15 @@ A DeepSeek Harness plugin that previews and permanently deletes archived Session
 - “运行中”按 `ctx.agents.get(id)?.status === 'running'` 判断，包含等待审批/回答的回合；运行中的会话仍拒绝删除。“已打开但空闲”是另一个状态，显示“已打开”，可直接清理。
 - 预览与执行都由 Host 重新推导候选；浏览器只提交选择项，不能指定任意路径。
 - Host 在执行时再次核对：路径必须位于工作区/会话目录内、不是符号链接、路径链上不能有 symlink/Junction、不是目录、不在受保护前缀中。工作区之外的文件、仍被其他会话引用的文件、引用状态未知的文件都**不可删除**，不是仅仅“默认不勾选”。
-- 会话专用目录必须位于某个工作区下，且目录内 `session.json` 的 `sessionId`、`workspace`、`folder` 与当前会话完全匹配。共享判断统一覆盖：其他会话的 cwd 等于目录、cwd 位于目录内部、显式文件/交付路径位于目录内部，以及 parent/child 子会话关系；冷会话和已加载会话使用同一套判断。删除前会扫描其余会话（包括运行中会话的 live events），目录仍被其他会话使用时保留。`index.json` 只移除当前会话的条目，并做读回校验与并发条目合并；不会重建或覆盖其他条目。
+- 会话专用目录必须位于某个工作区下，且目录内 `session.json` 的 `sessionId`、`workspace`、`folder` 与当前会话完全匹配。共享判断统一覆盖：其他会话的 cwd 等于目录、cwd 位于目录内部、显式文件/交付路径位于目录内部，以及 parent/child 子会话关系；冷会话和已加载会话使用同一套判断。删除前会扫描其余会话（包括运行中会话的 live events），目录仍被其他会话使用时保留。`index.json` 只移除当前会话的条目：提交前重新读取最新快照并合并，外部新增、字段更新和删除都会保留；与 session-archive 共用 `conversations/.index.lock`，双方的读取-合并-原子替换串行执行。合并或写后校验失败会进入报告和 journal warning，而不是静默覆盖。
 - 预览 token 现在同时绑定：会话 revision、文件身份（dev/ino/size/mtime/ctime/birthtime）、会话目录递归清单摘要、选项和候选集合。预览后文件被改写、替换、删除后重建，或目录中新增/删除/深层变化，都会使原 token 失效，必须重新预览。
 - token 在首次异步执行前即被占用；同一 token 的并发请求会得到 `preview-in-use` / `preview-consumed`，最多执行一次。会话清理与目录清理共用 Host 内写操作队列；pending 的追加、移除和启动收尾也串行更新。
-- 会话清理与目录清理在 `<DSH_HOME>/session-cleaner.lock` 上建立跨进程锁。另一个仍存活的 Host 进程正在清理时返回 `cleanup-locked`；进程退出后遗留的锁会按 PID 判定并自动清理。
+- 会话清理与目录清理在 `<DSH_HOME>/session-cleaner.lock` 上建立跨进程锁。另一个仍存活的 Host 进程正在清理时返回 `cleanup-locked`；锁文件刚创建但内容尚未写完时视为“创建中”，等待后返回冲突，不会删除无法确认归属的锁。陈旧锁通过重命名、文件身份核对和再次读取来接管，避免误删另一个进程刚建立的新锁；释放时核对 token，只移除自己的锁。启动恢复也使用同一把锁，因此另一个进程仍在执行任务时不会把 `running` journal 误标为中断。
 - 受保护区域：`DSH_HOME` 的会话/存储/附件/缓存/配置目录、Harness 安装目录、系统目录、用户主目录下的 `.ssh` / `.aws` / `.gnupg` / `.kube` / `.config`，以及任何 `session.*.jsonl*` / `session.json` / `conversations/index.json` / `workspace.json` / `settings.yaml` / 凭据文件。
 - 工作区文件默认不勾选：工作区之外的文件、仍被其他会话引用的文件、会话开始前已存在的文件（例如被 `edit` 的既有源码）；前两类即使手动勾选也不会被 Host 接受。默认勾选只针对可由创建时间证明“会话期间新建”且来源为 `write` / `str_replace_editor` 的文件；`edit` / `present` / 扫描结果需要手动确认。文件创建时间晚于会话最后事件 5 分钟后，不再算作会话期间新建。
 - 删除前需要两次点击确认（“永久删除所选内容” → “确认永久删除”）；操作不可撤销。
-- 驻留会话的收尾：文件删除成功后，插件把会话 ID 写入 `<DSH_HOME>/session-cleaner-pending.json`，保留工作区记账与归档标记直到下一次启动；启动时 `finalizePending()` 再 detach/unarchive/unpin。detach、unarchive 或 unpin 失败的普通会话也会写入 pending，下次启动重试，不再只留下警告。这样既不需要为了删除而重启，也不会产生“未分组”幽灵。
-- 每次会话清理都会在首个不可逆操作前写入 `<DSH_HOME>/session-cleaner-journal.json`，记录任务 ID、已确认的会话/选项、预览指纹摘要、当前阶段、已处理/失败/待收尾会话和最终报告摘要。进程中断后，下次启动会把 `running` 记录标记为 `interrupted`，并对 journal 中已完成日志删除的会话只恢复 detach/unarchive/unpin 记账；不会自动重放文件/附件/目录删除。设置页会显示上次任务，并提供“重新预览剩余会话”，恢复删除仍需重新预览确认。若 Client 请求超时但 Host 仍在执行，会显示运行中任务并自动刷新状态，不会重复提交删除。
+- 驻留会话的收尾：文件删除成功后，插件把会话 ID 写入 `<DSH_HOME>/session-cleaner-pending.json`，保留工作区记账与归档标记直到下一次启动；启动时 `finalizePending()` 再 detach/unarchive/unpin。收尾前会先检查日志：如果日志重新出现（恢复、同步或后续写入），不会 detach/unarchive，而是取消该 pending 条目并写入 `<DSH_HOME>/session-cleaner-pending-conflicts.json`，设置页显示需要人工检查的会话；日志无法读取时保留 pending 并记录原因。detach、unarchive 或 unpin 失败的普通会话也会写入 pending，下次启动重试，不再只留下警告。这样既不需要为了删除而重启，也不会产生“未分组”幽灵。
+- 每次会话清理都会在首个不可逆操作前写入 `<DSH_HOME>/session-cleaner-journal.json`，记录任务 ID、`requestId`、已确认的会话/选项、预览指纹摘要、当前阶段、已处理/失败/待收尾会话，以及逐项资源（文件、附件、溢出目录、会话目录）的路径、身份、字节数和执行状态。目录清理也会写入同结构的 `kind: "folders"` journal。任务历史保存在 `<DSH_HOME>/session-cleaner-journal-history/`（最多 20 个），可按 `taskId` 或 `requestId` 查询，新任务不会覆盖仍可处理的旧 partial/interrupted 任务。日志已删除但文件、附件或溢出目录处理失败时，重新预览会从 journal 中恢复这些失败资源作为候选，要求用户重新勾选；文件身份变化会标记为“上次任务后已变化”。进程中断后，下次启动会把 `running` 记录标记为 `interrupted`，并对 journal 中已完成日志删除的会话只恢复 detach/unarchive/unpin 记账；不会自动重放文件/附件/目录删除。设置页会显示上次任务，并用 `resumeIds` 提供“重新预览剩余会话”；恢复删除仍需重新预览确认。若 Client 请求超时但 Host 仍在执行，会按 `requestId` 找回原任务并自动刷新状态，不会重复提交删除。
 - 目录统计与递归清单在同一次遍历中完成；扫描受条目预算限制，超限、权限不足或读取失败会显示为“不完整”，整目录删除会被阻止，而不是把部分大小当作完整大小。
 
 ## 安装
@@ -73,11 +73,11 @@ plugin_manager install_bundle  target: <仓库绝对路径>
 
 - Host：`dsh-session-cleaner-thao712` 的 `index.js`，注册 `POST /dsh-session-cleaner/api`，使用 `connection.requestRejection()` 做 Host/Origin 围栏与登录态校验。
 - Client：`client.js` 注册 `settings.section`（id `session-cleaner`）。
-- `journal` 返回最近一次会话清理任务的 journal；设置页在任务中断或部分完成时显示任务 ID、阶段、已处理/失败/待收尾数量和重新预览提示。
+- `journal` 返回最近一次清理任务、最近任务摘要和待人工检查的 pending conflicts；传入 `taskId` 或 `requestId` 可查询历史任务。设置页在任务中断或部分完成时显示任务 ID、阶段、已处理/失败/待收尾数量、失败资源数和重新预览提示。
 - `preview` 返回短期 `previewToken`；`delete` 必须携带该 token，并重新推导候选、比较文件身份与会话目录清单摘要，避免执行用户没看过的预览。同一 token 只能执行一次，执行中或已完成会分别返回 `preview-in-use` / `preview-consumed`。
-- 对话目录：`folders` 返回目录清单与 `previewToken`；token 为每个目录保存独立指纹，`folders-delete` 只校验本次实际选中的目录，重新扫描目录大小/修改时间/递归清单/状态指纹。删除前再次校验目录位于 `conversations/` 直接子目录、不是 symlink/Junction、元数据匹配（有 `session.json` 时）；运行中的目录被拒绝，已加载但空闲的目录允许清理。
-- 会话日志路径由 JSONL 后端的确定性布局推导，并在删除前再次校验目录名与根目录归属。
-- 删除顺序：先处理检查点与会话日志；等所有会话的日志结果确定后，再删除会话目录并执行 detach/unarchive。这样批量选择中某个会话删除失败时，仍存活的会话所依赖的会话目录会保留。失败时同样保留归档状态和原工作区位置，并把可重试的记账写入 pending。
+- 对话目录：`folders` 返回目录清单与 `previewToken`；token 为每个目录保存独立指纹，`folders-delete` 只校验本次实际选中的目录，重新扫描目录大小/修改时间/递归清单/状态指纹。删除前再次校验目录位于 `conversations/` 直接子目录、不是 symlink/Junction、元数据匹配（有 `session.json` 时）；运行中的目录被拒绝，已加载但空闲的目录允许清理。目录清理会写入独立 journal，返回 `taskId`，部分失败可按任务查询。
+- 会话日志路径由 JSONL 后端的确定性布局推导，并在删除前再次校验目录名与根目录归属。日志定位区分“确认不存在”和“无法读取”：只有 `ENOENT` 进入 missing 分支，`EACCES` / `EPERM` / I/O 错误会作为失败返回，并保留归档、工作区和检查点记录。
+- 删除顺序：先解析并校验日志目录，确认可读后再处理检查点与会话日志；等所有会话的日志结果确定后，再删除会话目录并执行 detach/unarchive。这样批量选择中某个会话删除失败时，仍存活的会话所依赖的会话目录会保留。失败时同样保留归档状态和原工作区位置，并把可重试的记账写入 pending。
 - 兼容 `@local/session-archive`：读取 `conversations/index.json` 与每个目录的 `session.json`，并消费 `working-directory/change` 事件，因此相对工具路径会按会话专用目录解析。
 - 附件按 `sha256:<hex>` 解析到 `attachments/v1/objects`、`file-objects` 与 `files`。
 
@@ -92,7 +92,7 @@ plugin_manager install_bundle  target: <仓库绝对路径>
 - 共享引用检查其余会话日志与当前 live events 中的工具路径；其他进程、未提交草稿、外部程序直接引用同一附件对象的情况仍无法完全证明安全。相关文件/附件会被保留或要求逐项确认。
 - 运行中状态和“已打开”都只在当前 Host 进程内检测；另一个 Host 进程若仍打开同一会话，本插件无法看到它的写入锁。请确保该会话没有被其他进程使用。归档不会自动卸载 Agent，但已打开的空闲会话可以在不重启的情况下清理文件；工作区/归档记账会在下次启动自动收尾。
 - 预览与确认之间文件内容可能变化；执行时会重新推导候选、校验文件身份和目录递归清单，并拒绝已失效的路径。内容哈希成本较高，未被纳入每次校验；重要文件请在确认前重新预览。
-- journal 只记录任务与阶段，会自动恢复已完成日志删除会话的记账，但不会在崩溃后自动重放文件/附件/目录删除；恢复删除需要重新选择并预览。若日志在中断后重新出现或后台写入恢复，恢复逻辑会保留该日志并把会话视为新的/恢复的会话，仍需以新预览和运行状态检查为准。
+- journal 会记录逐项资源状态，但不会在崩溃后自动重放文件/附件/目录删除；恢复删除需要重新选择并预览。若日志在中断后重新出现或后台写入恢复，恢复逻辑会保留该日志并把会话视为新的/恢复的会话，仍需以新预览和运行状态检查为准。历史 journal 最多保留 20 个任务，更早的记录会被清理。
 - 若其他进程正占用日志或附件，Windows 可能拒绝删除；报告会列出失败项，可关闭占用后重试。
 - 会话搜索索引是派生索引；删除后会在后台触发一次对账。若部署禁用了搜索，残留行会在下一次成功搜索时被清除。
 - 删除文件后可能顺带移除因此变空的父目录（仅限工作区/会话目录边界内，且只移除空目录）。
@@ -106,7 +106,7 @@ plugin_manager install_bundle  target: <仓库绝对路径>
 npm test
 ```
 
-回归测试覆盖：预览 token 单次使用、已加载会话删除与待收尾记账、下次启动 finalize、工作区外文件、不可读的其余会话、symlink/Junction 祖先、投影缓存实际删除、共享会话目录、未知目录项、索引保留其他条目、默认选项、运行中会话引用、detach 失败、嵌套 baseDir，以及对话目录的保留 out/全部删除、残留目录、已加载目录清理。
+回归测试覆盖：预览 token 单次使用、已加载会话删除与待收尾记账、下次启动 finalize、日志重新出现时取消收尾、工作区外文件、不可读的其余会话、symlink/Junction 祖先、投影缓存实际删除、共享会话目录、未知目录项、索引保留其他条目及并发新增/更新/删除合并、默认选项、运行中会话引用、detach 失败、嵌套 baseDir，以及对话目录的保留 out/全部删除、残留目录、已加载目录清理、目录 journal 与任务查询、文件/目录失败后的逐项恢复。锁相关用例覆盖不完整锁、陈旧锁接管、活锁启动保护、释放时保留其他持有者；日志错误分类覆盖 `EACCES` 不被当作缺失。
 
 ## License
 

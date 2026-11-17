@@ -19,6 +19,8 @@ import {
 } from 'node:path'
 import {
   lstat,
+  mkdir,
+  open,
   readFile,
   readdir,
   rename,
@@ -50,6 +52,7 @@ const MAX_SCAN_ENTRIES = 20000
 const MAX_SCAN_DEPTH = 4
 const MAX_FILE_CANDIDATES = 500
 const MAX_REFERENCE_SESSIONS = 400
+const MAX_RECOVERY_RESOURCES = 200
 const FACT_CACHE_TTL_MS = 5 * 60 * 1000
 const MAX_FACT_CACHE = 200
 const PREVIEW_TOKEN_TTL_MS = 15 * 60 * 1000
@@ -63,9 +66,17 @@ const CONVERSATION_METADATA = 'session.json'
 const CONVERSATION_INDEX = 'index.json'
 const CONVERSATION_RULES = 'AGENTS.md'
 const PENDING_FILE = 'session-cleaner-pending.json'
+const PENDING_CONFLICTS_FILE = 'session-cleaner-pending-conflicts.json'
 const JOURNAL_FILE = 'session-cleaner-journal.json'
+const JOURNAL_HISTORY_DIR = 'session-cleaner-journal-history'
 const LOCK_FILE = 'session-cleaner.lock'
-const JOURNAL_VERSION = 1
+const INDEX_LOCK_FILE = '.index.lock'
+const JOURNAL_VERSION = 2
+const MAX_JOURNAL_HISTORY = 20
+const LOCK_INCOMPLETE_STALE_MS = 30000
+const LOCK_RETRY_DELAY_MS = 100
+const INDEX_LOCK_STALE_MS = 15000
+const INDEX_LOCK_WAIT_MS = 5000
 const KNOWN_FOLDER_ENTRIES = new Set(['work', 'out', CONVERSATION_METADATA, 'AGENTS.md'])
 
 const SKIP_DIRS = new Set([
@@ -99,6 +110,8 @@ async function lstatSafe(path) {
 }
 
 async function lstatResult(path) {
+  const injected = injectedFsError('lstat', path)
+  if (injected !== undefined) return { error: injected }
   try {
     return { info: await lstat(path) }
   } catch (error) {
@@ -110,6 +123,31 @@ function errorCode(error) {
   return error !== null && typeof error === 'object' && typeof error.code === 'string'
     ? error.code
     : 'UNKNOWN'
+}
+
+function delay(ms) {
+  return new Promise((resolveDelay) => setTimeout(resolveDelay, ms))
+}
+
+/**
+ * Test-only seam. The regression suite injects a deterministic filesystem
+ * failure or pauses an index commit at a precise point; production never sets
+ * this symbol.
+ */
+const TEST_HOOKS = Symbol.for('dsh.session-cleaner.test-hooks')
+
+function testHook(name) {
+  const hooks = globalThis[TEST_HOOKS]
+  if (hooks === null || typeof hooks !== 'object') return undefined
+  const hook = hooks[name]
+  return typeof hook === 'function' ? hook : undefined
+}
+
+function injectedFsError(operation, path) {
+  const factory = testHook('fsError')
+  if (factory === undefined) return undefined
+  const error = factory(operation, path)
+  return error instanceof Error ? error : undefined
 }
 
 function describeFsError(error) {
@@ -177,13 +215,20 @@ async function sizeOfDirectory(path, budget = 200000) {
   return (await scanDirectorySize(path, budget)).bytes
 }
 
-async function listNames(path) {
+async function listNamesResult(path) {
+  const injected = injectedFsError('listNames', path)
+  if (injected !== undefined) return { error: injected }
   try {
     const entries = await readdir(path, { withFileTypes: true })
-    return entries.filter((entry) => entry.isFile()).map((entry) => entry.name)
-  } catch {
-    return []
+    return { names: entries.filter((entry) => entry.isFile()).map((entry) => entry.name) }
+  } catch (error) {
+    return { error }
   }
+}
+
+async function listNames(path) {
+  const result = await listNamesResult(path)
+  return result.names ?? []
 }
 
 function isInside(child, parent) {
@@ -454,39 +499,77 @@ function projectionCachePath(id) {
   return join(homeDirectory(), 'storages', 'session_projcache', 'sessions', `${id}.json`)
 }
 
+function isSessionLogName(name) {
+  return /^session(?:\.v\d+)?\.jsonl(?:\.zstd)?$/.test(name)
+}
+
 async function hasSessionLog(directory) {
-  const names = await listNames(directory)
-  return names.some((name) => /^session(?:\.v\d+)?\.jsonl(?:\.zstd)?$/.test(name))
+  const names = await listNamesResult(directory)
+  if (names.error !== undefined) throw names.error
+  return names.names.some(isSessionLogName)
 }
 
-async function existingSessionDirectory(project, encoded) {
-  if (!(await isRealDirectory(project))) return undefined
-  const candidate = join(project, encoded)
-  if (!(await isRealDirectory(candidate))) return undefined
-  if (!(await hasSessionLog(candidate))) return undefined
-  return candidate
-}
-
-async function resolveSessionDirectory(root, header, id) {
-  const encoded = encodeSegment(id)
-  if (typeof header.cwd === 'string' && header.cwd.length > 0) {
-    const found = await existingSessionDirectory(join(root, projectKey(header.cwd)), encoded)
-    if (found !== undefined) return found
+async function existingSessionDirectoryResult(project, encoded) {
+  const projectInfo = await lstatResult(project)
+  if (projectInfo.error !== undefined) {
+    if (errorCode(projectInfo.error) === 'ENOENT') return { missing: true }
+    return { error: projectInfo.error }
   }
-  const noCwd = await existingSessionDirectory(join(root, '_no-cwd'), encoded)
-  if (noCwd !== undefined) return noCwd
+  if (!projectInfo.info.isDirectory() || projectInfo.info.isSymbolicLink()) return { missing: true }
+  const candidate = join(project, encoded)
+  const candidateInfo = await lstatResult(candidate)
+  if (candidateInfo.error !== undefined) {
+    if (errorCode(candidateInfo.error) === 'ENOENT') return { missing: true }
+    return { error: candidateInfo.error }
+  }
+  if (!candidateInfo.info.isDirectory() || candidateInfo.info.isSymbolicLink()) return { missing: true }
+  const names = await listNamesResult(candidate)
+  if (names.error !== undefined) return { error: names.error }
+  if (!names.names.some(isSessionLogName)) return { missing: true }
+  return { directory: candidate }
+}
+
+/**
+ * Distinguishes "the log is really gone" from "the log cannot be inspected".
+ * Only ENOENT reaches the missing branch; permission and I/O failures are
+ * returned as an error so the caller keeps the archive and workspace records.
+ */
+async function resolveSessionDirectoryResult(root, header, id) {
+  const encoded = encodeSegment(id)
+  const candidates = []
+  if (typeof header?.cwd === 'string' && header.cwd.length > 0) {
+    candidates.push(join(root, projectKey(header.cwd)))
+  }
+  candidates.push(join(root, '_no-cwd'))
+  let readError
+  for (const project of candidates) {
+    const result = await existingSessionDirectoryResult(project, encoded)
+    if (result.directory !== undefined) return { directory: result.directory }
+    if (result.error !== undefined && readError === undefined) readError = result.error
+  }
   let projects
   try {
     projects = await readdir(root, { withFileTypes: true })
-  } catch {
-    return undefined
+  } catch (error) {
+    if (errorCode(error) === 'ENOENT' && readError === undefined) return { missing: true }
+    return { error: readError ?? error }
   }
   for (const entry of projects) {
     if (!entry.isDirectory()) continue
-    const found = await existingSessionDirectory(join(root, entry.name), encoded)
-    if (found !== undefined) return found
+    const result = await existingSessionDirectoryResult(join(root, entry.name), encoded)
+    if (result.directory !== undefined) return { directory: result.directory }
+    if (result.error !== undefined && readError === undefined) readError = result.error
   }
-  return undefined
+  if (readError !== undefined) return { error: readError }
+  return { missing: true }
+}
+
+async function resolveSessionDirectory(root, header, id) {
+  const result = await resolveSessionDirectoryResult(root, header, id)
+  if (result.error !== undefined) {
+    throw new Error(`cannot inspect the Session log directory: ${describeFsError(result.error)}`)
+  }
+  return result.directory
 }
 
 function assertOwnedSessionDirectory(root, directory, id) {
@@ -807,6 +890,39 @@ async function factsFor(ctx, id, revision, headerCwd) {
   return facts
 }
 
+/**
+ * A partial or interrupted task can leave selected resources behind after the
+ * Session log is gone. Their journal entries preserve path, identity and the
+ * original confirmation, so a new preview can list them again and let the user
+ * re-confirm the remaining work.
+ */
+async function loadRecoveryResources(ctx, ids) {
+  const wanted = new Set(ids)
+  const resources = new Map()
+  let tasks
+  try {
+    tasks = await listJournalTasks()
+  } catch {
+    return []
+  }
+  for (const task of tasks) {
+    if (task === null || typeof task !== 'object') continue
+    if (task.kind === 'folders') continue
+    if (task.status !== 'partial' && task.status !== 'interrupted') continue
+    if (!Array.isArray(task.ids) || !task.ids.some((id) => wanted.has(id))) continue
+    for (const resource of task.resources || []) {
+      if (resource === null || typeof resource !== 'object') continue
+      if (resource.status !== 'failed') continue
+      const key = `${resource.type}:${resource.id}`
+      if (resources.has(key)) continue
+      if (!Array.isArray(resource.sessionIds) || !resource.sessionIds.some((id) => wanted.has(id))) continue
+      resources.set(key, { ...resource, taskId: task.id })
+      if (resources.size >= MAX_RECOVERY_RESOURCES) return [...resources.values()]
+    }
+  }
+  return [...resources.values()]
+}
+
 async function buildPreview(ctx, ids, options) {
   if (!Array.isArray(ids) || ids.length === 0) {
     throw new HttpError(400, 'no-sessions', 'Select at least one archived Session.')
@@ -886,6 +1002,8 @@ async function buildPreview(ctx, ids, options) {
       logBytes: 0,
       logSizeComplete: false,
       logManifestHash: null,
+      logMissing: false,
+      logError: undefined,
       projectionCache: { path: projectionCachePath(id), exists: false, bytes: 0 },
       readError: undefined,
       lastEventTime: snapshot?.header.createdAt ?? 0,
@@ -900,11 +1018,17 @@ async function buildPreview(ctx, ids, options) {
     base.projectionCache = { path: cachePath, exists: cacheSize > 0, bytes: cacheSize }
     projectionBytes += cacheSize
 
-    const directory = await resolveSessionDirectory(root, snapshot.header, id)
-    if (directory !== undefined) {
-      base.logDir = directory
-      base.logFiles = await listNames(directory)
-      const logStats = await scanFolder(directory)
+    const logResult = await resolveSessionDirectoryResult(root, snapshot.header, id)
+    if (logResult.directory !== undefined) {
+      base.logDir = logResult.directory
+      const names = await listNamesResult(logResult.directory)
+      if (names.error !== undefined) {
+        base.logError = `cannot inspect the log directory: ${describeFsError(names.error)}`
+        warnings.push(`Session ${id}: ${base.logError}; its archive and workspace records will be kept.`)
+      } else {
+        base.logFiles = names.names
+      }
+      const logStats = await scanFolder(logResult.directory)
       base.logBytes = logStats.totalBytes
       base.logSizeComplete = logStats.complete
       base.logManifestHash = logStats.manifestHash
@@ -912,7 +1036,11 @@ async function buildPreview(ctx, ids, options) {
       if (logStats.complete !== true) {
         warnings.push(`Session ${id}: the log size is a lower bound because ${logStats.errors[0] ?? 'the directory scan was incomplete'}.`)
       }
+    } else if (logResult.error !== undefined) {
+      base.logError = `cannot inspect the log directory: ${describeFsError(logResult.error)}`
+      warnings.push(`Session ${id}: ${base.logError}; the archive and workspace records will be kept.`)
     } else {
+      base.logMissing = true
       warnings.push(`Session ${id}: its stored log directory was not found. Only the archive entry and checkpoint can be removed.`)
     }
 
@@ -988,7 +1116,39 @@ async function buildPreview(ctx, ids, options) {
   }
 
   const sessionInfo = new Map(sessions.map((session) => [session.id, session]))
+  const recoveryResources = await loadRecoveryResources(ctx, unique)
+  for (const resource of recoveryResources) {
+    if (resource.type !== 'file' || options.workspaceFiles !== true) continue
+    for (const id of resource.sessionIds ?? []) {
+      const session = sessionInfo.get(id)
+      if (session === undefined) continue
+      if (session.workspace === null && typeof resource.workspaceRoot === 'string') {
+        session.recoveryWorkspaceRoot = resource.workspaceRoot
+      }
+      addFileCandidate(fileMap, { path: resource.id, origins: ['recovered'] }, session, options, true)
+      const candidate = fileMap.get(pathKey(resource.id))
+      if (candidate !== undefined) {
+        candidate.recoveredTaskId = resource.taskId
+        candidate.recoveredIdentity = resource.identity ?? null
+      }
+    }
+  }
+
   const spills = options.spills === true ? await findSpillDirectories(ctx, unique) : []
+  if (options.spills === true) {
+    const seenSpills = new Set(spills.map((spill) => spill.directory))
+    for (const resource of recoveryResources) {
+      if (resource.type !== 'spill' || !Array.isArray(resource.sessionIds) || resource.sessionIds.length === 0) continue
+      if (seenSpills.has(resource.id)) continue
+      const directory = resource.id
+      const info = await lstatResult(directory)
+      if (info.error !== undefined || !info.info.isDirectory() || info.info.isSymbolicLink()) continue
+      const bytes = await sizeOfDirectory(directory)
+      if (typeof resource.bytes === 'number' && bytes !== resource.bytes) continue
+      seenSpills.add(directory)
+      spills.push({ id: resource.sessionIds[0], root: dirname(directory), directory, bytes, recovered: true })
+    }
+  }
   const spillBytes = spills.reduce((sum, spill) => sum + spill.bytes, 0)
   if (fileMap.size >= MAX_FILE_CANDIDATES) {
     warnings.push(`The workspace file list stopped at ${MAX_FILE_CANDIDATES} candidates. Narrow the selection or inspect the workspace manually.`)
@@ -1083,9 +1243,29 @@ async function buildPreview(ctx, ids, options) {
   }
 
   await enrichFileCandidates(fileMap, sessionInfo)
+  for (const candidate of fileMap.values()) {
+    if (candidate.recoveredTaskId === undefined) continue
+    candidate.selectedByDefault = false
+    if (candidate.recoveredIdentity !== null && candidate.identity !== null &&
+        !sameFileIdentity(candidate.identity, candidate.recoveredIdentity)) {
+      candidate.recoveryChanged = true
+      candidate.reason = 'This file changed after the earlier task; review it before deleting.'
+      candidate.reasonCode = 'recovery-changed'
+    }
+  }
 
   const attachmentList = []
   if (options.attachments === true) {
+    for (const resource of recoveryResources) {
+      if (resource.type !== 'attachment') continue
+      if (attachments.has(resource.id)) continue
+      attachments.set(resource.id, {
+        id: resource.id,
+        kind: 'file',
+        bytes: Number(resource.bytes) || 0,
+        sessionIds: Array.isArray(resource.sessionIds) ? [...resource.sessionIds] : [],
+      })
+    }
     for (const attachment of attachments.values()) {
       const users = attachmentIndex.get(attachment.id)
       const sharedWith = users === undefined ? [] : [...users].filter((id) => !unique.includes(id))
@@ -1116,6 +1296,7 @@ async function buildPreview(ctx, ids, options) {
         reason,
         reasonCode,
         sharedWith,
+        sessionIds: users === undefined ? [] : [...users],
       })
     }
   }
@@ -1496,6 +1677,9 @@ async function enrichFileCandidates(fileMap, sessionInfo) {
         boundaries.push(session.workspace.path)
       }
       if (typeof session.cwd === 'string' && session.cwd.length > 0) boundaries.push(session.cwd)
+      if (typeof session.recoveryWorkspaceRoot === 'string' && session.recoveryWorkspaceRoot.length > 0) {
+        boundaries.push(session.recoveryWorkspaceRoot)
+      }
     }
     const containing = boundaries
       .filter((root) => isInside(candidate.path, root))
@@ -1581,8 +1765,12 @@ async function removeProjectionCache(ctx, id, warnings, expectedBytes) {
 async function removeSessionDirectory(root, directory, id, expectedManifestHash) {
   if (directory === undefined) return { removed: false, reason: 'missing' }
   assertOwnedSessionDirectory(root, directory, id)
-  const info = await lstatSafe(directory)
-  if (info === undefined) return { removed: false, reason: 'missing' }
+  const statResult = await lstatResult(directory)
+  if (statResult.error !== undefined) {
+    if (errorCode(statResult.error) === 'ENOENT') return { removed: false, reason: 'missing' }
+    throw new Error(`cannot inspect the Session log directory: ${describeFsError(statResult.error)}`)
+  }
+  const info = statResult.info
   if (!info.isDirectory() || info.isSymbolicLink()) {
     throw new Error('refusing to delete a Session directory that is not a real directory')
   }
@@ -1640,8 +1828,13 @@ async function removeAttachment(ctx, attachment) {
   let bytes = 0
   let removed = false
   const removeFile = async (path) => {
-    const info = await lstatSafe(path)
-    if (info === undefined || !info.isFile()) return
+    const result = await lstatResult(path)
+    if (result.error !== undefined) {
+      if (errorCode(result.error) === 'ENOENT') return
+      throw new Error(`cannot inspect attachment ${path}: ${describeFsError(result.error)}`)
+    }
+    const info = result.info
+    if (!info.isFile()) return
     if (info.isSymbolicLink()) return
     await unlink(path)
     bytes += info.size
@@ -1650,7 +1843,11 @@ async function removeAttachment(ctx, attachment) {
   /* A digest may have been admitted as an image and later as a generic file;
      the reference check already proved that no remaining Session names it. */
   await removeFile(paths.imageObject)
-  const referenceInfo = await lstatSafe(paths.fileReference)
+  const referenceStat = await lstatResult(paths.fileReference)
+  if (referenceStat.error !== undefined && errorCode(referenceStat.error) !== 'ENOENT') {
+    throw new Error(`cannot inspect attachment reference ${paths.fileReference}: ${describeFsError(referenceStat.error)}`)
+  }
+  const referenceInfo = referenceStat.info
   if (referenceInfo !== undefined && referenceInfo.isSymbolicLink()) {
     throw new Error('refusing to delete a file-reference directory that is a symlink')
   }
@@ -1733,6 +1930,8 @@ async function removeFileCandidate(candidate, warnings) {
     }
   }
   const bytes = info.size
+  const injected = injectedFsError('unlink', candidate.path)
+  if (injected !== undefined) throw injected
   await unlink(candidate.path)
   const boundary = candidate.workspaceRoot
   if (typeof boundary === 'string') {
@@ -2040,17 +2239,43 @@ function journalPath() {
   return join(homeDirectory(), JOURNAL_FILE)
 }
 
-async function readJournalRecord() {
-  const result = await readJsonFileDetailed(journalPath())
+function journalHistoryDirectory() {
+  return join(homeDirectory(), JOURNAL_HISTORY_DIR)
+}
+
+function safeTaskFileId(id) {
+  return typeof id === 'string' && /^[A-Za-z0-9_-]{1,64}$/.test(id) ? id : undefined
+}
+
+function journalHistoryPath(id) {
+  const safe = safeTaskFileId(id)
+  return safe === undefined ? undefined : join(journalHistoryDirectory(), `${safe}.json`)
+}
+
+async function readJournalFile(path) {
+  const result = await readJsonFileDetailed(path)
   if (result.missing === true) return undefined
   if (result.error !== undefined) {
-    throw new Error(`cannot read ${journalPath()}: ${describeFsError(result.error)}`)
+    throw new Error(`cannot read ${path}: ${describeFsError(result.error)}`)
   }
   const value = result.value
   if (value === null || typeof value !== 'object' || Array.isArray(value)) {
     return { version: JOURNAL_VERSION, status: 'invalid', phase: 'unknown', updatedAt: 0 }
   }
   return value
+}
+
+async function readJournalRecord() {
+  return readJournalFile(journalPath())
+}
+
+async function readJournalTask(id) {
+  const path = journalHistoryPath(id)
+  if (path === undefined) return undefined
+  const record = await readJournalFile(path)
+  if (record !== undefined) return record
+  const latest = await readJournalRecord()
+  return latest !== undefined && latest.id === id ? latest : undefined
 }
 
 let journalQueue = Promise.resolve()
@@ -2061,68 +2286,355 @@ function withJournalLock(task) {
   return run
 }
 
+async function pruneJournalHistory() {
+  let entries
+  try {
+    entries = await readdir(journalHistoryDirectory(), { withFileTypes: true })
+  } catch {
+    return
+  }
+  const files = entries.filter((entry) => entry.isFile() && entry.name.endsWith('.json'))
+  if (files.length <= MAX_JOURNAL_HISTORY) return
+  const withTime = []
+  for (const entry of files) {
+    const path = join(journalHistoryDirectory(), entry.name)
+    const info = await lstatResult(path)
+    withTime.push({ path, mtimeMs: info.info?.mtimeMs ?? 0 })
+  }
+  withTime.sort((left, right) => right.mtimeMs - left.mtimeMs)
+  for (const item of withTime.slice(MAX_JOURNAL_HISTORY)) {
+    try {
+      await unlink(item.path)
+    } catch {
+      /* a concurrent query may be reading the old task */
+    }
+  }
+}
+
+async function writeJournalHistory(record) {
+  const path = journalHistoryPath(record?.id)
+  if (path === undefined) return
+  try {
+    await mkdir(journalHistoryDirectory(), { recursive: true })
+    await writeJsonAtomic(path, record)
+    await pruneJournalHistory()
+  } catch {
+    /* the latest journal remains authoritative; history is best effort */
+  }
+}
+
+async function writeJournalFiles(record) {
+  await writeJsonAtomic(journalPath(), record)
+  await writeJournalHistory(record)
+}
+
 async function persistJournal(record) {
   record.updatedAt = Date.now()
-  return withJournalLock(() => writeJsonAtomic(journalPath(), record))
+  return withJournalLock(() => writeJournalFiles(record))
+}
+
+async function listJournalTasks() {
+  const tasks = []
+  let entries
+  try {
+    entries = await readdir(journalHistoryDirectory(), { withFileTypes: true })
+  } catch {
+    entries = []
+  }
+  for (const entry of entries) {
+    if (!entry.isFile() || !entry.name.endsWith('.json')) continue
+    try {
+      const record = await readJournalFile(join(journalHistoryDirectory(), entry.name))
+      if (record !== undefined) tasks.push(record)
+    } catch {
+      /* skip a damaged history entry */
+    }
+  }
+  const latest = await readJournalRecord().catch(() => undefined)
+  if (latest !== undefined && !tasks.some((task) => task.id === latest.id)) tasks.push(latest)
+  tasks.sort((left, right) => (right.updatedAt ?? 0) - (left.updatedAt ?? 0))
+  return tasks.slice(0, MAX_JOURNAL_HISTORY)
+}
+
+function pendingConflictsPath() {
+  return join(homeDirectory(), PENDING_CONFLICTS_FILE)
+}
+
+async function readPendingConflicts() {
+  const result = await readJsonFileDetailed(pendingConflictsPath())
+  if (result.missing === true) return []
+  if (result.error !== undefined) {
+    throw new Error(`cannot read ${pendingConflictsPath()}: ${describeFsError(result.error)}`)
+  }
+  if (!Array.isArray(result.value)) return []
+  return result.value.filter((entry) => entry !== null && typeof entry === 'object' &&
+    typeof entry.id === 'string' && isSafeSessionId(entry.id))
+}
+
+async function writePendingConflicts(entries) {
+  const path = pendingConflictsPath()
+  const seen = new Set()
+  const unique = []
+  for (const entry of entries) {
+    if (!isSafeSessionId(entry?.id) || seen.has(entry.id)) continue
+    seen.add(entry.id)
+    unique.push({ id: entry.id, reason: String(entry.reason ?? ''), at: Number(entry.at) || Date.now() })
+  }
+  if (unique.length === 0) {
+    try {
+      await unlink(path)
+    } catch (error) {
+      if (errorCode(error) !== 'ENOENT') throw error
+    }
+    return
+  }
+  await writeJsonAtomic(path, unique)
+}
+
+let conflictQueue = Promise.resolve()
+
+function withConflictLock(task) {
+  const run = conflictQueue.then(() => task(), () => task())
+  conflictQueue = run.then(() => undefined, () => undefined)
+  return run
+}
+
+async function recordPendingConflict(id, reason) {
+  if (!isSafeSessionId(id)) return
+  await withConflictLock(async () => {
+    const conflicts = await readPendingConflicts()
+    const existing = conflicts.find((entry) => entry.id === id)
+    if (existing !== undefined) {
+      existing.reason = reason
+      existing.at = Date.now()
+    } else {
+      conflicts.push({ id, reason, at: Date.now() })
+    }
+    await writePendingConflicts(conflicts)
+  })
+}
+
+async function clearPendingConflicts(ids) {
+  const wanted = new Set(ids.filter(isSafeSessionId))
+  if (wanted.size === 0) return
+  await withConflictLock(async () => {
+    const conflicts = await readPendingConflicts()
+    const remaining = conflicts.filter((entry) => !wanted.has(entry.id))
+    if (remaining.length !== conflicts.length) await writePendingConflicts(remaining)
+  })
 }
 
 function cleanupLockPath() {
   return join(homeDirectory(), LOCK_FILE)
 }
 
+const ACTIVE_LOCKS = Symbol.for('dsh.session-cleaner.active-locks')
+const PROCESS_HOST_ID = randomBytes(8).toString('hex')
+
+function activeLockRegistry() {
+  const store = globalThis
+  if (!(store[ACTIVE_LOCKS] instanceof Map)) store[ACTIVE_LOCKS] = new Map()
+  return store[ACTIVE_LOCKS]
+}
+
+function isProcessAlive(pid) {
+  if (!Number.isInteger(pid) || pid <= 0) return false
+  try {
+    process.kill(pid, 0)
+    return true
+  } catch (error) {
+    return errorCode(error) !== 'ESRCH'
+  }
+}
+
+function validLockRecord(record) {
+  return record !== null && typeof record === 'object' &&
+    typeof record.token === 'string' && record.token.length > 0 &&
+    Number.isInteger(record.pid) && record.pid > 0 &&
+    typeof record.startedAt === 'number'
+}
+
+async function readLockState(path) {
+  const result = await lstatResult(path)
+  if (result.error !== undefined) {
+    if (errorCode(result.error) === 'ENOENT') return { missing: true }
+    return { error: result.error }
+  }
+  const info = result.info
+  if (!info.isFile()) return { invalid: true, info }
+  let text
+  try {
+    text = await readFile(path, 'utf8')
+  } catch (error) {
+    if (errorCode(error) === 'ENOENT') return { missing: true }
+    return { invalid: true, info, error }
+  }
+  let record
+  try {
+    record = JSON.parse(text)
+  } catch {
+    record = undefined
+  }
+  if (!validLockRecord(record)) return { invalid: true, info }
+  return { record, info }
+}
+
+function lockIdentity(info) {
+  return [info?.dev, info?.ino, info?.size, info?.mtimeMs, info?.birthtimeMs].map(String).join(':')
+}
+
+async function restoreQuarantinedLock(quarantine, path) {
+  try {
+    await rename(quarantine, path)
+  } catch {
+    try {
+      await unlink(quarantine)
+    } catch {
+      /* the quarantine file is harmless and will be ignored */
+    }
+  }
+}
+
 /**
- * Cross-process mutex for cleanup operations sharing one DSH_HOME. The
- * in-process queue is still the first line of defence; this file prevents a
- * second Host process from starting an overlapping deletion. A lock owned by a
- * dead PID is recovered automatically.
+ * Move a stale lock out of the way with identity checks. Another process may
+ * replace the lock between inspection and takeover; the rename target is
+ * verified before anything is removed, and a lock that changed identity is put
+ * back instead of being deleted.
+ */
+async function breakStaleLock(path, state) {
+  const quarantine = `${path}.stale-${process.pid}-${randomBytes(6).toString('hex')}`
+  try {
+    await rename(path, quarantine)
+  } catch (error) {
+    if (errorCode(error) === 'ENOENT') return
+    throw new HttpError(409, 'cleanup-locked', `The cleanup lock could not be recovered safely: ${formatError(error)}`)
+  }
+  const after = await lstatResult(quarantine)
+  if (after.error !== undefined || state.info === undefined || lockIdentity(state.info) !== lockIdentity(after.info)) {
+    await restoreQuarantinedLock(quarantine, path)
+    throw new HttpError(409, 'cleanup-locked', 'The cleanup lock changed while it was being recovered; retry.')
+  }
+  const check = await readLockState(quarantine)
+  if (check.record !== undefined) {
+    const ownerActive = check.record.pid === process.pid
+      ? activeLockRegistry().has(pathKey(path))
+      : isProcessAlive(check.record.pid)
+    if (ownerActive) {
+      await restoreQuarantinedLock(quarantine, path)
+      throw new HttpError(409, 'cleanup-locked', 'Another cleanup task still owns the lock; retry after it finishes.')
+    }
+  }
+  try {
+    await unlink(quarantine)
+  } catch (error) {
+    if (errorCode(error) !== 'ENOENT') {
+      throw new HttpError(409, 'cleanup-locked', `The stale cleanup lock could not be removed: ${formatError(error)}`)
+    }
+  }
+}
+
+async function releaseCleanupLock(path, token) {
+  const key = pathKey(path)
+  const registry = activeLockRegistry()
+  try {
+    const hook = testHook('beforeLockRelease')
+    if (hook !== undefined) {
+      try {
+        await hook({ path, token })
+      } catch {
+        /* a test hook must not block release */
+      }
+    }
+    const state = await readLockState(path)
+    if (state.record !== undefined && state.record.token === token) {
+      try {
+        await unlink(path)
+      } catch (error) {
+        if (errorCode(error) !== 'ENOENT') {
+          /* a lock that cannot be cleaned is recovered after its PID exits */
+        }
+      }
+    }
+  } finally {
+    if (registry.get(key) === token) registry.delete(key)
+  }
+}
+
+/**
+ * Cross-process mutex for cleanup operations sharing one DSH_HOME. The owner is
+ * written through the creating descriptor, so a lock file visible with empty or
+ * partial content is treated as "being created": the contender waits briefly
+ * and then returns a conflict instead of deleting a lock it cannot attribute.
+ * A stale lock is quarantined and identity-checked before removal.
  */
 async function acquireCleanupLock(label) {
   const path = cleanupLockPath()
-  for (let attempt = 0; attempt < 3; attempt += 1) {
-    const token = randomBytes(12).toString('hex')
-    const record = {
-      token,
-      pid: process.pid,
-      label,
-      startedAt: Date.now(),
-    }
+  const key = pathKey(path)
+  const registry = activeLockRegistry()
+  if (registry.has(key)) {
+    throw new HttpError(409, 'cleanup-locked', 'This Harness process is already running a cleanup task.')
+  }
+  const token = randomBytes(12).toString('hex')
+  const record = {
+    version: 1,
+    token,
+    pid: process.pid,
+    hostId: PROCESS_HOST_ID,
+    label,
+    startedAt: Date.now(),
+  }
+  for (let attempt = 0; attempt < 8; attempt += 1) {
+    let created = false
     try {
-      await writeFile(path, `${JSON.stringify(record, null, 2)}\n`, { encoding: 'utf8', flag: 'wx' })
-      return async () => {
+      const handle = await open(path, 'wx')
+      created = true
+      try {
+        await handle.writeFile(`${JSON.stringify(record, null, 2)}\n`, 'utf8')
+        await handle.sync()
+      } finally {
+        await handle.close()
+      }
+      registry.set(key, token)
+      return () => releaseCleanupLock(path, token)
+    } catch (error) {
+      if (created) {
         try {
-          const current = await readJsonFileDetailed(path)
-          if (current.value !== null && typeof current.value === 'object' && current.value.token === token) {
-            await unlink(path)
-          }
+          await unlink(path)
         } catch {
-          /* a lock that cannot be cleaned will become stale after its PID exits */
+          /* the incomplete lock is reclaimed after its grace period */
         }
       }
-    } catch (error) {
       if (errorCode(error) !== 'EEXIST') {
         throw new HttpError(500, 'lock-failed', `Cannot create the cleanup lock: ${formatError(error)}`)
       }
     }
-    const current = await readJsonFileDetailed(path)
-    const owner = current.value !== null && typeof current.value === 'object' ? current.value : undefined
-    if (owner !== undefined && typeof owner.pid === 'number' && owner.pid !== process.pid) {
-      let alive = true
-      try {
-        process.kill(owner.pid, 0)
-      } catch (error) {
-        alive = errorCode(error) !== 'ESRCH'
-      }
-      if (alive) {
+    const state = await readLockState(path)
+    if (state.missing === true) continue
+    if (state.error !== undefined) {
+      throw new HttpError(409, 'cleanup-locked', `The cleanup lock cannot be read: ${describeFsError(state.error)}`)
+    }
+    if (state.record !== undefined) {
+      const owner = state.record
+      if (owner.pid === process.pid) {
+        if (registry.has(key)) {
+          throw new HttpError(409, 'cleanup-locked', 'This Harness process is already running a cleanup task.')
+        }
+        /* A lock left by an earlier module instance in this same process. */
+      } else if (isProcessAlive(owner.pid)) {
         throw new HttpError(409, 'cleanup-locked', `Another Harness process (PID ${owner.pid}) is already running a cleanup task.`)
       }
+      await breakStaleLock(path, state)
+      continue
     }
-    try {
-      await unlink(path)
-    } catch (error) {
-      if (errorCode(error) !== 'ENOENT') {
-        throw new HttpError(409, 'cleanup-locked', 'A cleanup lock exists and cannot be cleared.')
+    const age = Date.now() - (Number.isFinite(state.info?.mtimeMs) ? state.info.mtimeMs : 0)
+    if (age < LOCK_INCOMPLETE_STALE_MS) {
+      if (attempt < 2) {
+        await delay(LOCK_RETRY_DELAY_MS * (attempt + 1))
+        continue
       }
+      throw new HttpError(409, 'cleanup-locked', 'Another process is creating the cleanup lock; retry after it finishes.')
     }
+    await breakStaleLock(path, state)
   }
   throw new HttpError(409, 'cleanup-locked', 'Could not acquire the cleanup lock; retry after the other cleanup finishes.')
 }
@@ -2134,7 +2646,7 @@ async function markInterruptedJournal(ctx) {
     record.status = 'interrupted'
     record.interruptedAt = Date.now()
     record.updatedAt = record.interruptedAt
-    await writeJsonAtomic(journalPath(), record)
+    await writeJournalFiles(record)
     ctx.logger?.warn?.(`session-cleaner: previous cleanup task ${record.id ?? 'unknown'} was interrupted; its journal is available for inspection.`)
   })
 }
@@ -2221,6 +2733,21 @@ async function finalizePending(ctx) {
   return withPendingLock(() => finalizePendingUnlocked(ctx))
 }
 
+async function inspectSessionLogPresence(ctx, id) {
+  let snapshot
+  try {
+    const snapshots = await ctx.sessionPersistence.list()
+    snapshot = snapshots.find((entry) => entry.header.id === id)
+  } catch (error) {
+    if (errorCode(error) === 'ENOENT') return { missing: true }
+    return { error }
+  }
+  if (snapshot === undefined) return { missing: true }
+  const result = await resolveSessionDirectoryResult(persistenceRoot(ctx), snapshot.header, id)
+  if (result.error !== undefined) return { error: result.error }
+  return { exists: result.directory !== undefined }
+}
+
 async function finalizePendingUnlocked(ctx) {
   const pending = await readPendingIds()
   if (pending.length === 0) return
@@ -2232,11 +2759,44 @@ async function finalizePendingUnlocked(ctx) {
       remaining.push(id)
       continue
     }
+    let presence
+    try {
+      presence = await inspectSessionLogPresence(ctx, id)
+    } catch (error) {
+      presence = { error }
+    }
+    if (presence.error !== undefined) {
+      remaining.push(id)
+      ctx.logger?.warn?.(`session-cleaner: pending Session ${id} was kept because its log cannot be inspected: ${describeFsError(presence.error)}`)
+      try {
+        await recordPendingConflict(id, `the Session log could not be inspected: ${describeFsError(presence.error)}`)
+      } catch {
+        /* the next startup retries the pending entry */
+      }
+      continue
+    }
+    if (presence.exists === true) {
+      /* A restored or rewritten log means the previous deletion did not end
+         that Session. Finalizing its bookkeeping would unarchive a Session that
+         still exists, so stop and surface the conflict instead. */
+      ctx.logger?.warn?.(`session-cleaner: pending Session ${id} still has a log; its deferred bookkeeping was cancelled.`)
+      try {
+        await recordPendingConflict(id, 'the Session log exists again; deferred bookkeeping was cancelled')
+      } catch {
+        /* the warning is also emitted through the logger */
+      }
+      continue
+    }
     try {
       const workspace = workspaces.find((item) => item.sessionIds.includes(id))
       if (workspace !== undefined) await workspace.detachSession(id)
       await registry.unarchiveSession(id)
       await registry.unpinSession(id)
+      try {
+        await clearPendingConflicts([id])
+      } catch {
+        /* the conflict marker is informational */
+      }
     } catch (error) {
       remaining.push(id)
       ctx.logger?.warn?.(`session-cleaner: could not finalize pending Session ${id}: ${formatError(error)}`)
@@ -2738,53 +3298,196 @@ function withIndexLock(indexPath, task) {
   return run
 }
 
-async function removeConversationIndexEntriesByFolder(indexPath, base, name, warnings) {
-  return withIndexLock(indexPath, () => removeConversationIndexEntriesByFolderUnlocked(indexPath, base, name, warnings))
+function indexSignature(value) {
+  if (value === null || typeof value !== 'object' || Array.isArray(value)) return JSON.stringify(value)
+  return JSON.stringify(Object.keys(value).sort().map((key) => [key, value[key]]))
 }
 
-async function removeConversationIndexEntriesByFolderUnlocked(indexPath, base, name, warnings) {
-  for (let attempt = 0; attempt < 3; attempt += 1) {
-    const index = await readJsonFile(indexPath, undefined)
-    if (index === null || typeof index !== 'object' || Array.isArray(index)) return false
-    const ids = Object.keys(index).filter((id) => {
-      const value = index[id]
-      if (value === null || typeof value !== 'object' || typeof value.folder !== 'string') return false
-      return value.folder === name ||
-        samePath(isAbsolute(value.folder) ? value.folder : join(base, value.folder), join(base, name))
-    })
-    if (ids.length === 0) return false
-    const next = { ...index }
-    for (const id of ids) delete next[id]
-    try {
-      await writeJsonAtomic(indexPath, next)
-    } catch (error) {
-      warnings.push(`Conversation index ${indexPath}: could not remove ${name} (${formatError(error)}).`)
-      return false
+async function takeOverIndexLock(lockPath) {
+  const before = await lstatResult(lockPath)
+  if (before.error !== undefined) return
+  const quarantine = `${lockPath}.stale-${process.pid}-${randomBytes(6).toString('hex')}`
+  try {
+    await rename(lockPath, quarantine)
+  } catch (error) {
+    if (errorCode(error) === 'ENOENT') return
+    throw error
+  }
+  const after = await lstatResult(quarantine)
+  if (after.error !== undefined || lockIdentity(before.info) !== lockIdentity(after.info)) {
+    await restoreQuarantinedLock(quarantine, lockPath)
+    throw new Error('the conversation index lock changed while it was being recovered')
+  }
+  const check = await readJsonFileDetailed(quarantine)
+  const owner = check.value
+  const validOwner = owner !== null && typeof owner === 'object' && Number.isInteger(owner.pid)
+  if (!validOwner) {
+    const age = Date.now() - (Number(after.info?.mtimeMs) || 0)
+    if (age < INDEX_LOCK_STALE_MS) {
+      await restoreQuarantinedLock(quarantine, lockPath)
+      throw new Error('the conversation index lock is being created')
     }
-    const after = await readJsonFile(indexPath, undefined)
-    if (after !== null && typeof after === 'object' && !Array.isArray(after) &&
-        ids.every((id) => !Object.prototype.hasOwnProperty.call(after, id))) {
-      const lost = Object.keys(index).filter((key) => !ids.includes(key) &&
-        !Object.prototype.hasOwnProperty.call(after, key))
-      if (lost.length === 0) return true
-      const merged = { ...after }
-      for (const key of lost) merged[key] = index[key]
+    try {
+      await unlink(quarantine)
+    } catch (error) {
+      if (errorCode(error) !== 'ENOENT') throw error
+    }
+    return
+  }
+  const ownerAlive = isProcessAlive(owner.pid)
+  const age = Date.now() - (Number(owner.startedAt) || 0)
+  if (ownerAlive && age < INDEX_LOCK_STALE_MS) {
+    await restoreQuarantinedLock(quarantine, lockPath)
+    throw new Error('the conversation index is locked by another writer')
+  }
+  try {
+    await unlink(quarantine)
+  } catch (error) {
+    if (errorCode(error) !== 'ENOENT') throw error
+  }
+}
+
+/**
+ * Cooperative lock shared with session-archive. Both plugins create the same
+ * sidecar file before a read-modify-write of `conversations/index.json`, so an
+ * append from the archive plugin cannot be overwritten by a cleanup deletion.
+ */
+async function withConversationIndexFileLock(indexPath, task) {
+  const lockPath = join(dirname(indexPath), INDEX_LOCK_FILE)
+  const token = randomBytes(12).toString('hex')
+  const deadline = Date.now() + INDEX_LOCK_WAIT_MS
+  for (;;) {
+    try {
+      const handle = await open(lockPath, 'wx')
       try {
-        await writeJsonAtomic(indexPath, merged)
-        const verified = await readJsonFile(indexPath, undefined)
-        if (verified !== null && typeof verified === 'object' && !Array.isArray(verified) &&
-            ids.every((id) => !Object.prototype.hasOwnProperty.call(verified, id)) &&
-            Object.keys(index).filter((key) => !ids.includes(key)).every((key) => Object.prototype.hasOwnProperty.call(verified, key))) {
-          return true
+        await handle.writeFile(JSON.stringify({ token, pid: process.pid, startedAt: Date.now() }), 'utf8')
+        await handle.sync()
+      } finally {
+        await handle.close()
+      }
+      try {
+        return await task()
+      } finally {
+        const state = await readJsonFileDetailed(lockPath)
+        if (state.value !== null && typeof state.value === 'object' && state.value.token === token) {
+          try {
+            await unlink(lockPath)
+          } catch {
+            /* the next writer recovers a stale index lock */
+          }
         }
-      } catch (error) {
-        warnings.push(`Conversation index ${indexPath}: could not restore ${lost.length} concurrent entry/entries (${formatError(error)}).`)
+      }
+    } catch (error) {
+      if (errorCode(error) !== 'EEXIST') throw error
+    }
+    if (Date.now() >= deadline) throw new Error('the conversation index is busy; retry after the other writer finishes')
+    try {
+      await takeOverIndexLock(lockPath)
+    } catch (error) {
+      if (Date.now() >= deadline) throw error
+    }
+    await delay(50)
+  }
+}
+
+/**
+ * Merge-on-commit update. The mutation is re-applied to a fresh snapshot just
+ * before the atomic rename; a concurrent addition, field update or deletion is
+ * therefore kept instead of being overwritten by an older read. A test hook can
+ * write between the snapshot and the rename to exercise this window.
+ */
+async function commitConversationIndex(indexPath, apply, verify, warnings) {
+  try {
+    return await withIndexLock(indexPath, () => withConversationIndexFileLock(indexPath, async () => {
+    for (let attempt = 0; attempt < 5; attempt += 1) {
+      const state = await readJsonFileDetailed(indexPath)
+      if (state.missing === true) {
+        warnings.push(`Conversation index ${indexPath}: it is missing; the folder was removed but its index entry could not be updated.`)
         return false
       }
+      if (state.error !== undefined) {
+        warnings.push(`Conversation index ${indexPath}: it could not be read (${describeFsError(state.error)}); its entry was not updated.`)
+        return false
+      }
+      const index = state.value
+      if (index === null || typeof index !== 'object' || Array.isArray(index)) {
+        warnings.push(`Conversation index ${indexPath}: it is malformed; the folder was removed but its index entry could not be updated.`)
+        return false
+      }
+      const next = apply(index)
+      if (next === null) return false
+      const temporary = `${indexPath}.${process.pid}.${Date.now()}.${randomBytes(4).toString('hex')}.tmp`
+      try {
+        await writeFile(temporary, `${JSON.stringify(next, null, 2)}\n`, 'utf8')
+      } catch (error) {
+        warnings.push(`Conversation index ${indexPath}: could not be written (${formatError(error)}).`)
+        return false
+      }
+      const hook = testHook('beforeIndexCommit')
+      if (hook !== undefined) {
+        try {
+          await hook({ indexPath, next })
+        } catch {
+          /* a test hook must not break a real cleanup */
+        }
+      }
+      const current = await readJsonFileDetailed(indexPath)
+      if (current.error !== undefined || current.missing === true ||
+          indexSignature(current.value) !== indexSignature(index)) {
+        try {
+          await unlink(temporary)
+        } catch {
+          /* the temporary file is ignored by every reader */
+        }
+        continue
+      }
+      try {
+        await rename(temporary, indexPath)
+      } catch (error) {
+        try {
+          await unlink(temporary)
+        } catch {
+          /* no temporary file to clean */
+        }
+        warnings.push(`Conversation index ${indexPath}: could not replace it (${formatError(error)}).`)
+        return false
+      }
+      const verified = await readJsonFileDetailed(indexPath)
+      if (verified.error !== undefined || verified.missing === true || verify(verified.value) !== true) {
+        warnings.push(`Conversation index ${indexPath}: the update could not be verified after concurrent writes; refresh and retry.`)
+        return false
+      }
+      return true
     }
+    warnings.push(`Conversation index ${indexPath}: entries changed concurrently; refresh and retry.`)
+    return false
+  }))
+  } catch (error) {
+    warnings.push(`Conversation index ${indexPath}: it could not be updated safely (${formatError(error)}); refresh and retry.`)
+    return false
   }
-  warnings.push(`Conversation index ${indexPath}: entries for ${name} changed concurrently; refresh and retry.`)
-  return false
+}
+
+function indexEntryMatchesFolder(value, base, name) {
+  if (value === null || typeof value !== 'object' || typeof value.folder !== 'string') return false
+  return value.folder === name ||
+    samePath(isAbsolute(value.folder) ? value.folder : join(base, value.folder), join(base, name))
+}
+
+async function removeConversationIndexEntriesByFolder(indexPath, base, name, warnings) {
+  const matching = (index) => Object.keys(index).filter((id) => indexEntryMatchesFolder(index[id], base, name))
+  return commitConversationIndex(
+    indexPath,
+    (index) => {
+      const ids = matching(index)
+      if (ids.length === 0) return null
+      const next = { ...index }
+      for (const id of ids) delete next[id]
+      return next
+    },
+    (index) => matching(index).length === 0,
+    warnings,
+  )
 }
 
 async function removeFolderTree(ctx, row, warnings) {
@@ -2811,6 +3514,8 @@ async function removeFolderTree(ctx, row, warnings) {
     throw new Error('the conversation folder changed after preview; refresh and preview again')
   }
   const bytes = stats.totalBytes
+  const injected = injectedFsError('rm', folder)
+  if (injected !== undefined) throw injected
   await rm(folder, { recursive: true, force: false, maxRetries: 3 })
   await removeConversationIndexEntriesByFolder(join(base, CONVERSATION_INDEX), base, row.name, warnings)
   return { removed: true, bytes }
@@ -2891,8 +3596,50 @@ async function executeFolderDeletion(ctx, body, tokenRecord) {
     errors: [],
     warnings: [],
   }
+  const requestId = typeof body.requestId === 'string' && /^[A-Za-z0-9_-]{1,64}$/.test(body.requestId)
+    ? body.requestId
+    : undefined
   const seen = new Set()
+  const journal = {
+    version: JOURNAL_VERSION,
+    id: randomBytes(8).toString('hex'),
+    kind: 'folders',
+    requestId,
+    createdAt: Date.now(),
+    updatedAt: Date.now(),
+    status: 'running',
+    phase: 'folders',
+    ids: [],
+    options: {},
+    fingerprintHash: null,
+    completedSessions: [],
+    failedSessions: [],
+    pending: [],
+    resources: [],
+    folders: requested.map((item) => ({
+      key: item.key,
+      mode: item.mode === 'all' ? 'all' : 'keepOut',
+      status: 'pending',
+    })),
+    resumeIds: [],
+    summary: null,
+    errors: [],
+    warnings: [],
+  }
+  const journalFolder = (key) => journal.folders.find((entry) => entry.key === key)
+  try {
+    await persistJournal(journal)
+  } catch (error) {
+    throw new HttpError(500, 'journal-write-failed', `Cannot write the folder-cleanup journal before deletion: ${formatError(error)}`)
+  }
   tokenRecord.started = true
+  const saveFolderProgress = async () => {
+    try {
+      await persistJournal(journal)
+    } catch (error) {
+      report.warnings.push(`Folder-cleanup journal progress could not be saved (${formatError(error)}); the cleanup itself continues.`)
+    }
+  }
   for (const item of requested) {
     if (seen.has(item.key)) continue
     seen.add(item.key)
@@ -2901,19 +3648,31 @@ async function executeFolderDeletion(ctx, body, tokenRecord) {
       throw new HttpError(409, 'stale-preview', 'A conversation folder is no longer listed. Refresh and preview again.')
     }
     const mode = item.mode === 'all' ? 'all' : 'keepOut'
+    const entry = journalFolder(item.key)
+    if (entry !== undefined) {
+      entry.name = row.name
+      entry.path = row.path
+      entry.bytes = mode === 'all' ? row.totalBytes : row.workBytes
+    }
     if (row.running) {
       report.folders.skipped += 1
       report.errors.push({ scope: 'folder', id: row.name, message: row.reason ?? 'The Session is running.' })
+      if (entry !== undefined) entry.status = 'skipped'
+      await saveFolderProgress()
       continue
     }
     if (mode === 'all' && row.allDeletable !== true) {
       report.folders.skipped += 1
       report.errors.push({ scope: 'folder', id: row.name, message: row.reason ?? 'Whole-folder deletion is not allowed.' })
+      if (entry !== undefined) entry.status = 'skipped'
+      await saveFolderProgress()
       continue
     }
     if (mode === 'keepOut' && row.keepOutDeletable !== true) {
       report.folders.skipped += 1
       report.errors.push({ scope: 'folder', id: row.name, message: row.reason ?? 'This folder cannot be cleaned.' })
+      if (entry !== undefined) entry.status = 'skipped'
+      await saveFolderProgress()
       continue
     }
     try {
@@ -2923,8 +3682,10 @@ async function executeFolderDeletion(ctx, body, tokenRecord) {
           report.folders.removed += 1
           report.bytes.removed += removal.bytes
           report.bytes.workRemoved += row.workBytes
+          if (entry !== undefined) entry.status = 'removed'
         } else {
           report.folders.skipped += 1
+          if (entry !== undefined) entry.status = 'skipped'
         }
       } else {
         const removal = await keepFolderOut(ctx, row, report.warnings)
@@ -2932,12 +3693,33 @@ async function executeFolderDeletion(ctx, body, tokenRecord) {
         report.bytes.removed += removal.workBytes + removal.agentsBytes
         report.bytes.workRemoved += removal.workBytes
         report.bytes.outKept += removal.outBytes
+        if (entry !== undefined) entry.status = 'removed'
       }
     } catch (error) {
       report.folders.skipped += 1
       report.errors.push({ scope: 'folder', id: row.name, message: formatError(error) })
+      if (entry !== undefined) {
+        entry.status = 'failed'
+        entry.error = formatError(error)
+      }
+      await saveFolderProgress()
     }
+    await saveFolderProgress()
   }
+  journal.phase = 'done'
+  journal.status = report.errors.length > 0 ? 'partial' : 'completed'
+  journal.summary = {
+    requested: report.folders.requested,
+    removed: report.folders.removed,
+    keptOut: report.folders.keptOut,
+    skipped: report.folders.skipped,
+    errors: report.errors.length,
+    warnings: report.warnings.length,
+  }
+  journal.errors = report.errors.slice(0, 50)
+  journal.warnings = report.warnings.slice(0, 50)
+  await saveFolderProgress()
+  report.taskId = journal.id
   completeRecord(tokenRecord)
   return report
 }
@@ -2959,50 +3741,18 @@ async function writeJsonAtomic(path, value) {
 }
 
 async function removeConversationIndexEntry(indexPath, id, warnings) {
-  return withIndexLock(indexPath, () => removeConversationIndexEntryUnlocked(indexPath, id, warnings))
-}
-
-async function removeConversationIndexEntryUnlocked(indexPath, id, warnings) {
-  for (let attempt = 0; attempt < 3; attempt += 1) {
-    const index = await readJsonFile(indexPath, undefined)
-    if (index === null || typeof index !== 'object' || Array.isArray(index)) {
-      if (attempt === 0) {
-        warnings.push(`Conversation index ${indexPath}: it is missing or malformed; the folder was removed but its index entry could not be updated.`)
-      }
-      return false
-    }
-    if (!Object.prototype.hasOwnProperty.call(index, id)) return false
-    const next = { ...index }
-    delete next[id]
-    try {
-      await writeJsonAtomic(indexPath, next)
-    } catch (error) {
-      warnings.push(`Conversation index ${indexPath}: could not remove ${id} (${formatError(error)}).`)
-      return false
-    }
-    const after = await readJsonFile(indexPath, undefined)
-    if (after === null || typeof after !== 'object' || Array.isArray(after)) continue
-    if (!Object.prototype.hasOwnProperty.call(after, id)) {
-      const lost = Object.keys(index).filter((key) => key !== id && !Object.prototype.hasOwnProperty.call(after, key))
-      if (lost.length === 0) return true
-      const merged = { ...after }
-      for (const key of lost) merged[key] = index[key]
-      try {
-        await writeJsonAtomic(indexPath, merged)
-        const verified = await readJsonFile(indexPath, undefined)
-        if (verified !== null && typeof verified === 'object' && !Array.isArray(verified) &&
-            !Object.prototype.hasOwnProperty.call(verified, id) &&
-            lost.every((key) => Object.prototype.hasOwnProperty.call(verified, key))) {
-          return true
-        }
-      } catch (error) {
-        warnings.push(`Conversation index ${indexPath}: could not restore ${lost.length} concurrent entry/entries (${formatError(error)}).`)
-        return false
-      }
-    }
-  }
-  warnings.push(`Conversation index ${indexPath}: the entry for ${id} changed concurrently; refresh and retry.`)
-  return false
+  return commitConversationIndex(
+    indexPath,
+    (index) => {
+      if (!Object.prototype.hasOwnProperty.call(index, id)) return null
+      const next = { ...index }
+      delete next[id]
+      return next
+    },
+    (index) => index !== null && typeof index === 'object' && !Array.isArray(index) &&
+      !Object.prototype.hasOwnProperty.call(index, id),
+    warnings,
+  )
 }
 
 async function removeConversationFolder(entry, id, warnings) {
@@ -3112,9 +3862,70 @@ async function executeDeletion(ctx, body, tokenRecord) {
   }
   const failedSessions = new Set()
   const removedSessions = []
+  const requestId = typeof body.requestId === 'string' && /^[A-Za-z0-9_-]{1,64}$/.test(body.requestId)
+    ? body.requestId
+    : undefined
+  const journalResources = []
+  const resourceIndex = new Map()
+  const addResource = (entry) => {
+    const key = `${entry.type}:${entry.id}`
+    if (resourceIndex.has(key)) return
+    resourceIndex.set(key, journalResources.length)
+    journalResources.push({ key, status: 'pending', ...entry })
+  }
+  for (const path of requestedFiles) {
+    const candidate = allowedFiles.get(pathKey(path))
+    if (candidate === undefined) continue
+    addResource({
+      type: 'file',
+      id: path,
+      sessionIds: Array.isArray(candidate.sessionIds) ? [...candidate.sessionIds] : [],
+      bytes: candidate.sizeBytes ?? 0,
+      identity: candidate.identity ?? null,
+      caseSensitive: candidate.caseSensitive === true,
+      workspaceRoot: candidate.workspaceRoot ?? null,
+    })
+  }
+  for (const attachmentId of requestedAttachments) {
+    const attachment = allowedAttachments.get(attachmentId)
+    if (attachment === undefined) continue
+    addResource({
+      type: 'attachment',
+      id: attachmentId,
+      bytes: attachment.bytes ?? 0,
+      sessionIds: Array.isArray(attachment.sessionIds) ? [...attachment.sessionIds] : [],
+    })
+  }
+  for (const spill of preview.spills || []) {
+    addResource({ type: 'spill', id: spill.directory, bytes: spill.bytes ?? 0, sessionIds: [spill.id] })
+  }
+  if (options.conversationFolder === true) {
+    for (const session of preview.sessions) {
+      const folder = session.conversationFolder
+      if (folder === null || folder === undefined || folder.deletable !== true) continue
+      addResource({
+        type: 'conversation-folder',
+        id: folder.path,
+        sessionIds: [session.id],
+        bytes: folder.bytes ?? 0,
+        manifestHash: folder.manifestHash ?? null,
+      })
+    }
+  }
+  const setResourceStatus = async (key, status, error, save = false) => {
+    const index = resourceIndex.get(key)
+    if (index === undefined) return
+    const entry = journalResources[index]
+    entry.status = status
+    if (error !== undefined) entry.error = formatError(error)
+    entry.finishedAt = Date.now()
+    if (save) await saveProgress()
+  }
   const journal = {
     version: JOURNAL_VERSION,
     id: randomBytes(8).toString('hex'),
+    kind: 'sessions',
+    requestId,
     createdAt: Date.now(),
     updatedAt: Date.now(),
     status: 'running',
@@ -3125,6 +3936,8 @@ async function executeDeletion(ctx, body, tokenRecord) {
     completedSessions: [],
     failedSessions: [],
     pending: [],
+    resources: journalResources,
+    resumeIds: [],
     summary: null,
     errors: [],
     warnings: [],
@@ -3160,6 +3973,44 @@ async function executeDeletion(ctx, body, tokenRecord) {
     }
     const wasOpen = isSessionOpen(ctx, id)
 
+    /* Resolve the log before touching the checkpoint: an unreadable log must
+       leave every archive, workspace and checkpoint record in place. */
+    let logResolution
+    if (session.missing === true) {
+      logResolution = { missing: true }
+    } else {
+      try {
+        logResolution = await resolveSessionDirectoryResult(persistenceRoot(ctx), {
+          cwd: session.cwd,
+        }, id)
+      } catch (error) {
+        failedSessions.add(id)
+        journal.failedSessions.push(id)
+        report.errors.push({ scope: 'session-log', id, message: formatError(error) })
+        await saveProgress()
+        continue
+      }
+      if (logResolution.error !== undefined) {
+        failedSessions.add(id)
+        journal.failedSessions.push(id)
+        report.errors.push({
+          scope: 'session-log',
+          id,
+          message: `cannot inspect the Session log directory: ${describeFsError(logResolution.error)}`,
+        })
+        await saveProgress()
+        continue
+      }
+    }
+
+    if (isAgentRunning(ctx, id)) {
+      failedSessions.add(id)
+      journal.failedSessions.push(id)
+      report.errors.push({ scope: 'session-live', id, message: 'The Session started running before its log deletion; its log was kept.' })
+      await saveProgress()
+      continue
+    }
+
     const projection = await removeProjectionCache(ctx, id, report.warnings, session.projectionCache?.bytes)
     if (projection.removed) {
       report.projection.removed += 1
@@ -3169,34 +4020,19 @@ async function executeDeletion(ctx, body, tokenRecord) {
     }
 
     let logRemoved = false
-    if (session.missing === true) {
+    if (logResolution.missing === true) {
       report.sessions.missing += 1
       logRemoved = true
     } else {
-      if (isAgentRunning(ctx, id)) {
-        failedSessions.add(id)
-        journal.failedSessions.push(id)
-        report.errors.push({ scope: 'session-live', id, message: 'The Session started running before its log deletion; its log was kept.' })
-        await saveProgress()
-        continue
-      }
       try {
-        const directory = await resolveSessionDirectory(persistenceRoot(ctx), {
-          cwd: session.cwd,
-        }, id)
-        if (directory === undefined) {
-          report.sessions.missing += 1
+        const removal = await removeSessionDirectory(persistenceRoot(ctx), logResolution.directory, id, session.logManifestHash)
+        if (removal.removed) {
+          report.logs.removed += 1
+          report.logs.bytes += removal.bytes
           logRemoved = true
         } else {
-          const removal = await removeSessionDirectory(persistenceRoot(ctx), directory, id, session.logManifestHash)
-          if (removal.removed) {
-            report.logs.removed += 1
-            report.logs.bytes += removal.bytes
-            logRemoved = true
-          } else {
-            report.sessions.missing += 1
-            logRemoved = true
-          }
+          report.sessions.missing += 1
+          logRemoved = true
         }
       } catch (error) {
         failedSessions.add(id)
@@ -3244,17 +4080,21 @@ async function executeDeletion(ctx, body, tokenRecord) {
       if (failedUser !== undefined) {
         report.conversation.skipped += 1
         report.warnings.push(`Session ${id}: conversation folder kept because Session ${failedUser} could not be cleaned and may still use it.`)
+        await setResourceStatus(`conversation-folder:${folder.path}`, 'skipped')
       } else if (folder.deletable !== true) {
         report.conversation.skipped += 1
         report.warnings.push(`Session ${id}: conversation folder kept because ${folder.reason ?? 'it is not safe to delete'}.`)
+        await setResourceStatus(`conversation-folder:${folder.path}`, 'skipped')
       } else {
         try {
           const removal = await removeConversationFolder(folder, id, report.warnings)
           report.conversation.removed += 1
           report.conversation.bytes += removal.bytes
+          await setResourceStatus(`conversation-folder:${folder.path}`, 'removed')
         } catch (error) {
           report.conversation.skipped += 1
           report.errors.push({ scope: 'conversation-folder', id, message: formatError(error) })
+          await setResourceStatus(`conversation-folder:${folder.path}`, 'failed', error, true)
         }
       }
     }
@@ -3348,6 +4188,7 @@ async function executeDeletion(ctx, body, tokenRecord) {
   for (const spill of preview.spills || []) {
     if (blocks(protectedSpills, spill.id)) {
       report.spills.skipped += 1
+      await setResourceStatus(`spill:${spill.directory}`, 'skipped')
       continue
     }
     try {
@@ -3355,20 +4196,24 @@ async function executeDeletion(ctx, body, tokenRecord) {
       if (removal.removed) {
         report.spills.removed += 1
         report.spills.bytes += removal.bytes
+        await setResourceStatus(`spill:${spill.directory}`, 'removed')
       } else {
         report.spills.skipped += 1
+        await setResourceStatus(`spill:${spill.directory}`, 'skipped')
         if (removal.reason === 'changed') {
           report.errors.push({ scope: 'spill', id: spill.directory, message: 'The spill directory changed after preview and was kept; preview again.' })
         }
       }
     } catch (error) {
       report.errors.push({ scope: 'spill', id: spill.directory, message: formatError(error) })
+      await setResourceStatus(`spill:${spill.directory}`, 'failed', error, true)
     }
   }
 
   for (const attachmentId of requestedAttachments) {
     if (blocks(protectedAttachments, attachmentId)) {
       report.attachments.skipped += 1
+      await setResourceStatus(`attachment:${attachmentId}`, 'skipped')
       continue
     }
     const attachment = allowedAttachments.get(attachmentId)
@@ -3378,17 +4223,21 @@ async function executeDeletion(ctx, body, tokenRecord) {
       if (removal.removed) {
         report.attachments.removed += 1
         report.attachments.bytes += removal.bytes
+        await setResourceStatus(`attachment:${attachmentId}`, 'removed')
       } else {
         report.attachments.skipped += 1
+        await setResourceStatus(`attachment:${attachmentId}`, 'skipped')
       }
     } catch (error) {
       report.errors.push({ scope: 'attachment', id: attachmentId, message: formatError(error) })
+      await setResourceStatus(`attachment:${attachmentId}`, 'failed', error, true)
     }
   }
 
   for (const path of requestedFiles) {
     if (blocks(protectedFiles, pathKey(path))) {
       report.files.skipped += 1
+      await setResourceStatus(`file:${path}`, 'skipped')
       continue
     }
     const candidate = allowedFiles.get(pathKey(path))
@@ -3398,8 +4247,10 @@ async function executeDeletion(ctx, body, tokenRecord) {
       if (removal.removed) {
         report.files.removed += 1
         report.files.bytes += removal.bytes
+        await setResourceStatus(`file:${path}`, 'removed')
       } else {
         report.files.skipped += 1
+        await setResourceStatus(`file:${path}`, 'skipped')
         if (removal.reason === 'changed') {
           report.errors.push({ scope: 'file', id: path, message: 'The file changed after preview and was kept; preview again.' })
         } else if (removal.reason === 'missing') {
@@ -3408,6 +4259,7 @@ async function executeDeletion(ctx, body, tokenRecord) {
       }
     } catch (error) {
       report.errors.push({ scope: 'file', id: path, message: formatError(error) })
+      await setResourceStatus(`file:${path}`, 'failed', error, true)
     }
   }
 
@@ -3436,14 +4288,77 @@ async function executeDeletion(ctx, body, tokenRecord) {
     errors: report.errors.length,
     warnings: report.warnings.length,
   }
+  const resume = new Set(journal.failedSessions)
+  for (const resource of journal.resources) {
+    if (resource.status !== 'failed') continue
+    for (const sessionId of resource.sessionIds ?? []) resume.add(sessionId)
+  }
+  journal.resumeIds = [...resume]
+  report.taskId = journal.id
+  report.resources = journal.resources
   journal.phase = 'done'
-  journal.status = report.errors.length > 0 || report.sessions.removed < selectedIds.size ? 'partial' : 'completed'
+  journal.status = report.errors.length > 0 || report.sessions.removed < selectedIds.size || journal.resumeIds.length > 0
+    ? 'partial'
+    : 'completed'
   journal.summary = report.summary
   journal.errors = report.errors.slice(0, 50)
   journal.warnings = report.warnings.slice(0, 50)
   await saveProgress()
+  try {
+    await clearPendingConflicts(journal.completedSessions)
+  } catch {
+    /* informational state; a later run clears it */
+  }
   completeRecord(tokenRecord)
   return report
+}
+
+/**
+ * Startup recovery mutates the journal and pending bookkeeping, so it must use
+ * the same cross-process mutex as a real cleanup. A live task in another Host
+ * keeps its `running` journal instead of being marked interrupted here.
+ */
+async function startupRecoveryNeeded() {
+  let journal
+  try {
+    journal = await readJournalRecord()
+  } catch {
+    return true
+  }
+  const journalWork = journal !== undefined && (
+    journal.status === 'running' ||
+    (journal.status === 'interrupted' && Array.isArray(journal.completedSessions) && journal.completedSessions.length > 0)
+  )
+  let pending
+  try {
+    pending = await readPendingIds()
+  } catch {
+    return true
+  }
+  return journalWork || pending.length > 0
+}
+
+async function runStartupRecovery(ctx) {
+  if (!(await startupRecoveryNeeded())) return
+  await withDeletionLock(async () => {
+    let release
+    try {
+      release = await acquireCleanupLock('startup-recovery')
+    } catch (error) {
+      if (error instanceof HttpError && error.code === 'cleanup-locked') {
+        ctx.logger?.warn?.(`session-cleaner: startup recovery skipped because ${formatError(error)}`)
+        return
+      }
+      throw error
+    }
+    try {
+      await markInterruptedJournal(ctx)
+      await finalizePending(ctx)
+      await recoverJournalBookkeeping(ctx)
+    } finally {
+      await release()
+    }
+  })
 }
 
 /* ------------------------------------------------------------------------- *
@@ -3479,7 +4394,38 @@ export function apply(ctx) {
         return
       }
       if (op === 'journal') {
-        sendJson(res, 200, { ok: true, value: { journal: await readJournalRecord() ?? null } })
+        const taskId = typeof body.taskId === 'string' && body.taskId.length > 0 ? body.taskId : undefined
+        const requestId = typeof body.requestId === 'string' && body.requestId.length > 0 ? body.requestId : undefined
+        let record
+        if (taskId !== undefined) {
+          record = await readJournalTask(taskId) ?? null
+        } else if (requestId !== undefined) {
+          const tasks = await listJournalTasks()
+          record = tasks.find((task) => task.requestId === requestId) ?? null
+        } else {
+          record = await readJournalRecord() ?? null
+        }
+        const [tasks, conflicts] = await Promise.all([
+          listJournalTasks().catch(() => []),
+          readPendingConflicts().catch(() => []),
+        ])
+        sendJson(res, 200, {
+          ok: true,
+          value: {
+            journal: record,
+            tasks: tasks.map((task) => ({
+              id: task.id,
+              kind: task.kind ?? 'sessions',
+              status: task.status,
+              phase: task.phase,
+              requestId: task.requestId ?? null,
+              createdAt: task.createdAt ?? null,
+              updatedAt: task.updatedAt ?? null,
+              summary: task.summary ?? null,
+            })),
+            conflicts,
+          },
+        })
         return
       }
       if (op === 'project-path') {
@@ -3555,11 +4501,7 @@ export function apply(ctx) {
     handler,
   }), `session-cleaner: POST ${ROUTE_PATH}`)
 
-  void (async () => {
-    await markInterruptedJournal(ctx)
-    await finalizePending(ctx)
-    await recoverJournalBookkeeping(ctx)
-  })().catch((error) => {
+  void runStartupRecovery(ctx).catch((error) => {
     ctx.logger?.warn?.(`session-cleaner: startup recovery failed: ${formatError(error)}`)
   })
 }

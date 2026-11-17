@@ -12,6 +12,7 @@
 
 | 项目 | 状态 |
 | --- | --- |
+| 代码版本 | `1.10.0`，本轮提交 `62397ca` |
 | 清理插件测试 | `npm test`，57 项通过，0 失败、0 跳过 |
 | session-archive | 冒烟测试通过 |
 | 语法检查 | `index.js`、`client.js`、session-archive `index.js` 通过 |

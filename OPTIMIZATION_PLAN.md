@@ -543,6 +543,7 @@ journal 当前保存会话 ID、选项、指纹摘要和最终错误等信息，
 | 项目 | 结果 |
 | --- | --- |
 | 清理插件版本 | `1.9.0` |
+| 代码提交 | `70ab00f`，`feat: complete second-round cleanup hardening`，已推送 `origin/main` |
 | 清理插件测试 | `npm test`，52 项通过，父测试通过，0 失败、0 跳过 |
 | session-archive | `1.2.0`，`npm test` 冒烟通过 |
 | 语法检查 | `node --check index.js`、`node --check client.js`、`node --check ../dsh-plugins/session-archive/index.js` 通过 |

@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict'
 import test from 'node:test'
-import { mkdtemp, mkdir, writeFile, readFile, access, rm, symlink, utimes } from 'node:fs/promises'
+import { mkdtemp, mkdir, writeFile, readFile, readdir, access, rm, symlink, utimes } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { Readable } from 'node:stream'
@@ -54,6 +54,7 @@ async function makeHarness(options = {}) {
     async detachSession(sessionId) {
       if (options.detachError === true) throw new Error('simulated detach failure')
       this.detached.push(sessionId)
+      this.sessionIds = this.sessionIds.filter((id) => id !== sessionId)
     },
     async attachSession(sessionId) { this.attached.push(sessionId) },
   }
@@ -94,7 +95,7 @@ async function makeHarness(options = {}) {
       async searchSessions() { return { items: [] } },
     },
     workspaceRegistry: {
-      archivedSessionIds: [...archived],
+      get archivedSessionIds() { return [...archived] },
       list() { return [workspace] },
       async unpinSession() {},
       async unarchiveSession(sessionId) { archived.delete(sessionId) },
@@ -1690,6 +1691,7 @@ test('session cleaner safety regressions', async (t) => {
       const options = { attachments: false, workspaceFiles: true, scanCreated: false, spills: false, conversationFolder: false, imageCache: false }
       const preview = await harness.call('preview', { ids: [harness.id], options })
       assert.equal(preview.value.files[0].selectedByDefault, true)
+      let firstTaskId
       await withTestHooks({
         fsError: fsErrorFor('unlink', file, 'EACCES'),
       }, async () => {
@@ -1697,6 +1699,7 @@ test('session cleaner safety regressions', async (t) => {
           ids: [harness.id], options, previewToken: preview.value.previewToken,
           confirmed: true, files: [file], attachments: [],
         })
+        firstTaskId = deleted.value.taskId
         assert.equal(deleted.ok, true)
         assert.equal(deleted.value.files.removed, 0)
         assert.equal(deleted.value.errors.some((error) => error.scope === 'file'), true)
@@ -1709,19 +1712,35 @@ test('session cleaner safety regressions', async (t) => {
       })
       harness.snapshots.splice(0, harness.snapshots.length)
       harness.workspace.sessionIds.length = 0
-      const secondPreview = await harness.call('preview', { ids: [harness.id], options })
+      await mkdir(harness.sessionDir, { recursive: true })
+      await writeFile(join(harness.sessionDir, 'session.v4.jsonl.zstd'), 'restored')
+      const protectedPreview = await harness.call('preview', { ids: [harness.id], options: { ...options, recoveryMode: true } })
+      assert.equal(protectedPreview.ok, false)
+      assert.equal(protectedPreview.error.code, 'not-archived')
+      await rm(harness.sessionDir, { recursive: true, force: true })
+      const normalPreview = await harness.call('preview', { ids: [harness.id], options })
+      assert.equal(normalPreview.ok, false)
+      assert.equal(normalPreview.error.code, 'not-archived')
+      const recoveryOptions = { ...options, recoveryMode: true }
+      const secondPreview = await harness.call('preview', { ids: [harness.id], options: recoveryOptions })
       assert.equal(secondPreview.ok, true)
       const recovered = secondPreview.value.files.find((entry) => entry.path === file)
       assert.ok(recovered)
       assert.equal(recovered.recoveredTaskId !== undefined, true)
       assert.equal(recovered.selectedByDefault, false)
       const secondDelete = await harness.call('delete', {
-        ids: [harness.id], options, previewToken: secondPreview.value.previewToken,
+        ids: [harness.id], options: recoveryOptions, previewToken: secondPreview.value.previewToken,
         confirmed: true, files: [file], attachments: [],
       })
       assert.equal(secondDelete.ok, true)
       assert.equal(secondDelete.value.files.removed, 1)
       await assert.rejects(access(file), /ENOENT/)
+      const source = await harness.call('journal', { taskId: firstTaskId })
+      assert.equal(source.value.journal.status, 'completed')
+      assert.equal(source.value.journal.resources.some((resource) => resource.status === 'recovered'), true)
+      const noMore = await harness.call('preview', { ids: [harness.id], options: recoveryOptions })
+      assert.equal(noMore.ok, false)
+      assert.equal(noMore.error.code, 'not-archived')
     } finally {
       await harness.cleanup()
     }
@@ -1775,6 +1794,227 @@ test('session cleaner safety regressions', async (t) => {
       assert.equal(latest.value.journal.kind, 'folders')
       assert.equal(latest.value.journal.status, 'completed')
       assert.equal(latest.value.tasks.some((task) => task.id === completed.value.taskId), true)
+    } finally {
+      await harness.cleanup()
+    }
+  })
+
+  await t.test('a checkpoint failure is recorded and recoverable after unarchive', async () => {
+    const harness = await makeHarness({ projection: true })
+    try {
+      const options = { attachments: false, workspaceFiles: false, scanCreated: false, spills: false, conversationFolder: false, imageCache: false }
+      const preview = await harness.call('preview', { ids: [harness.id], options })
+      const projectionPath = join(harness.home, 'storages', 'session_projcache', 'sessions', `${harness.id}.json`)
+      await withTestHooks({
+        fsError: fsErrorFor('unlink', projectionPath, 'EACCES'),
+      }, async () => {
+        const deleted = await harness.call('delete', {
+          ids: [harness.id], options, previewToken: preview.value.previewToken,
+          confirmed: true, files: [], attachments: [],
+        })
+        assert.equal(deleted.ok, true)
+        assert.equal(deleted.value.errors.some((error) => error.scope === 'projection'), true, JSON.stringify({ errors: deleted.value.errors, projection: deleted.value.projection, warnings: deleted.value.warnings }))
+        assert.equal(harness.archived.has(harness.id), false)
+        await access(projectionPath)
+        const task = await harness.call('journal', { taskId: deleted.value.taskId })
+        assert.equal(task.value.journal.status, 'partial')
+        assert.equal(task.value.journal.resources.some((resource) => resource.type === 'projection' && resource.status === 'failed'), true)
+        assert.equal(task.value.journal.resumeIds.includes(harness.id), true)
+      })
+      const normal = await harness.call('preview', { ids: [harness.id], options })
+      assert.equal(normal.ok, false)
+      assert.equal(normal.error.code, 'not-archived')
+      const recoveryOptions = { ...options, recoveryMode: true }
+      const recovery = await harness.call('preview', { ids: [harness.id], options: recoveryOptions })
+      assert.equal(recovery.ok, true)
+      assert.equal(recovery.value.sessions[0].recoveryOnly, true)
+      const retried = await harness.call('delete', {
+        ids: [harness.id], options: recoveryOptions, previewToken: recovery.value.previewToken,
+        confirmed: true, files: [], attachments: [],
+      })
+      assert.equal(retried.ok, true)
+      await assert.rejects(access(projectionPath), /ENOENT/)
+    } finally {
+      await harness.cleanup()
+    }
+  })
+
+  await t.test('an attachment failure keeps its selected Session and is recoverable', async () => {
+    const digest = 'b'.repeat(64)
+    const attachmentId = `sha256:${digest}`
+    const harness = await makeHarness({
+      events: [{
+        type: 'user/message', seq: 0, time: Date.now(),
+        data: {
+          role: 'user',
+          source: { kind: 'user' },
+          content: [{
+            type: 'image',
+            attachment: { attachmentId, mediaType: 'image/png', bytes: 3, width: 1, height: 1, name: 'image.png' },
+          }],
+        },
+      }],
+    })
+    const object = join(harness.home, 'attachments', 'v1', 'objects', 'bb', digest)
+    await mkdir(join(harness.home, 'attachments', 'v1', 'objects', 'bb'), { recursive: true })
+    await writeFile(object, 'img')
+    try {
+      const options = { attachments: true, workspaceFiles: false, scanCreated: false, spills: false, conversationFolder: false, imageCache: false }
+      const preview = await harness.call('preview', { ids: [harness.id], options })
+      assert.deepEqual(preview.value.attachments[0].sessionIds, [harness.id])
+      await withTestHooks({
+        fsError: fsErrorFor('lstat', object, 'EACCES'),
+      }, async () => {
+        const deleted = await harness.call('delete', {
+          ids: [harness.id], options, previewToken: preview.value.previewToken,
+          confirmed: true, files: [], attachments: [attachmentId],
+        })
+        assert.equal(deleted.ok, true)
+        assert.equal(deleted.value.errors.some((error) => error.scope === 'attachment'), true)
+        assert.equal(harness.archived.has(harness.id), false)
+        await access(object)
+        const task = await harness.call('journal', { taskId: deleted.value.taskId })
+        assert.equal(task.value.journal.status, 'partial')
+        const resource = task.value.journal.resources.find((entry) => entry.type === 'attachment')
+        assert.equal(resource.status, 'failed')
+        assert.deepEqual(resource.sessionIds, [harness.id])
+        assert.equal(task.value.journal.resumeIds.includes(harness.id), true)
+      })
+      const recoveryOptions = { ...options, recoveryMode: true }
+      const recovery = await harness.call('preview', { ids: [harness.id], options: recoveryOptions })
+      assert.equal(recovery.ok, true)
+      assert.equal(recovery.value.attachments.length, 1)
+      assert.equal(recovery.value.attachments[0].deletable, true)
+      const retried = await harness.call('delete', {
+        ids: [harness.id], options: recoveryOptions, previewToken: recovery.value.previewToken,
+        confirmed: true, files: [], attachments: [attachmentId],
+      })
+      assert.equal(retried.ok, true)
+      assert.equal(retried.value.attachments.removed, 1)
+      await assert.rejects(access(object), /ENOENT/)
+    } finally {
+      await harness.cleanup()
+    }
+  })
+
+  await t.test('one attachment records every selected owner', async () => {
+    const firstId = nextId()
+    const secondId = nextId()
+    const digest = 'c'.repeat(64)
+    const attachmentId = `sha256:${digest}`
+    const event = {
+      type: 'user/message', seq: 0, time: Date.now(),
+      data: {
+        role: 'user',
+        source: { kind: 'user' },
+        content: [{ type: 'image', attachment: { attachmentId, mediaType: 'image/png', bytes: 3 } }],
+      },
+    }
+    const harness = await makeHarness({
+      id: firstId,
+      snapshots: [
+        { header: { id: firstId, cwd: join(tmpdir(), `dsh-attach-${Date.now()}`), createdAt: Date.now() - 600000 }, revision: 'r1' },
+        { header: { id: secondId, cwd: join(tmpdir(), `dsh-attach-${Date.now()}`), createdAt: Date.now() - 900000 }, revision: 'r2' },
+      ],
+      sessionIds: [firstId, secondId],
+      archivedIds: [firstId, secondId],
+      eventsById: new Map([[firstId, [event]], [secondId, [event]]]),
+    })
+    try {
+      const options = { attachments: true, workspaceFiles: false, scanCreated: false, spills: false, conversationFolder: false, imageCache: false }
+      const preview = await harness.call('preview', { ids: [firstId, secondId], options })
+      assert.equal(preview.ok, true)
+      assert.equal(preview.value.attachments.length, 1)
+      assert.deepEqual([...preview.value.attachments[0].sessionIds].sort(), [firstId, secondId].sort())
+    } finally {
+      await harness.cleanup()
+    }
+  })
+
+  await t.test('an unfinished task survives journal history pruning', async () => {
+    const harness = await makeHarness()
+    const history = join(harness.home, 'session-cleaner-journal-history')
+    await mkdir(history, { recursive: true })
+    const writeTask = async (id, status, updatedAt) => {
+      await writeFile(join(history, `${id}.json`), JSON.stringify({
+        version: 2,
+        id,
+        kind: 'sessions',
+        status,
+        phase: status === 'completed' ? 'done' : 'artifacts',
+        updatedAt,
+        ids: [],
+        resources: [],
+        completedSessions: [],
+        failedSessions: [],
+        pending: [],
+        resumeIds: [],
+      }))
+    }
+    await writeTask('unfinished-partial', 'partial', Date.now() - 60000)
+    await writeTask('unfinished-running', 'running', Date.now() - 50000)
+    await writeTask('unfinished-interrupted', 'interrupted', Date.now() - 40000)
+    for (let index = 0; index < 21; index += 1) {
+      await writeTask(`completed-${String(index).padStart(2, '0')}`, 'completed', Date.now() - 30000 + index)
+    }
+    try {
+      const options = { attachments: false, workspaceFiles: false, scanCreated: false, spills: false, conversationFolder: false, imageCache: false }
+      const preview = await harness.call('preview', { ids: [harness.id], options })
+      const deleted = await harness.call('delete', {
+        ids: [harness.id], options, previewToken: preview.value.previewToken,
+        confirmed: true, files: [], attachments: [],
+      })
+      assert.equal(deleted.ok, true)
+      for (const id of ['unfinished-partial', 'unfinished-running', 'unfinished-interrupted']) {
+        const task = await harness.call('journal', { taskId: id })
+        assert.equal(task.value.journal.id, id)
+      }
+      const files = (await readdir(history)).filter((name) => name.endsWith('.json'))
+      const completed = []
+      for (const name of files) {
+        const record = JSON.parse(await readFile(join(history, name), 'utf8'))
+        if (record.status === 'completed') completed.push(name)
+      }
+      assert.ok(completed.length <= 20)
+      assert.ok(files.includes('unfinished-partial.json'))
+    } finally {
+      await harness.cleanup()
+    }
+  })
+
+  await t.test('a live index lock is not taken over after 15 seconds', async () => {
+    const workspacePath = join(tmpdir(), `dsh-index-live-ws-${Date.now()}-${sequence}`)
+    const id = nextId()
+    const folder = join(workspacePath, 'conversations', 'conversation')
+    await mkdir(join(folder, 'work'), { recursive: true })
+    await writeFile(join(folder, 'work', 'a.py'), 'x')
+    await writeFile(join(folder, 'session.json'), JSON.stringify({ sessionId: id, workspace: workspacePath, folder: 'conversation' }))
+    const indexPath = join(workspacePath, 'conversations', 'index.json')
+    await writeFile(indexPath, JSON.stringify({ [id]: { folder: 'conversation' } }))
+    const lock = join(workspacePath, 'conversations', '.index.lock')
+    await writeFile(lock, JSON.stringify({
+      token: 'live-index-owner',
+      pid: process.pid,
+      startedAt: Date.now() - 20000,
+    }))
+    const harness = await makeHarness({ id, workspacePath })
+    try {
+      const list = await harness.call('folders', {})
+      const row = list.value.folders.find((entry) => entry.name === 'conversation')
+      await withTestHooks({ indexLockWaitMs: 150 }, async () => {
+        const removed = await harness.call('folders-delete', {
+          previewToken: list.value.previewToken,
+          confirmed: true,
+          folders: [{ key: row.key, mode: 'all' }],
+        })
+        assert.equal(removed.ok, true)
+        assert.equal(removed.value.folders.removed, 1)
+        assert.equal(removed.value.warnings.some((warning) => /could not be updated safely/.test(warning)), true)
+      })
+      const index = JSON.parse(await readFile(indexPath, 'utf8'))
+      assert.deepEqual(index[id], { folder: 'conversation' })
+      const current = JSON.parse(await readFile(lock, 'utf8'))
+      assert.equal(current.token, 'live-index-owner')
     } finally {
       await harness.cleanup()
     }

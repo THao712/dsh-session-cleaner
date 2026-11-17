@@ -1319,10 +1319,9 @@ window.__ModuleLoader__.load({
             return
           }
           const completed = new Set(lastRun.completedSessions || [])
-          const ids = [...new Set((Array.isArray(lastRun.resumeIds) && lastRun.resumeIds.length > 0
-            ? lastRun.resumeIds
-            : (lastRun.ids || []))
-            .filter((id) => typeof id === 'string' && !completed.has(id)))]
+          const recovered = Array.isArray(lastRun.resumeIds) && lastRun.resumeIds.length > 0
+          const ids = [...new Set((recovered ? lastRun.resumeIds : (lastRun.ids || []))
+            .filter((id) => typeof id === 'string' && (recovered || !completed.has(id))))]
           if (ids.length === 0) {
             setSelectionNotice(t('lastRunNothing'))
             return
@@ -1336,6 +1335,7 @@ window.__ModuleLoader__.load({
             spills: true,
             imageCache: false,
             ...(lastRun.options || {}),
+            recoveryMode: true,
           }
           setSelected(new Set(ids))
           setOptions(resumedOptions)

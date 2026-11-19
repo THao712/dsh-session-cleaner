@@ -4,7 +4,7 @@
 
 当前版本：`1.10.0`（本轮代码提交 `62397ca`，上一轮 `0f3031f`）
 
-配套插件：`@local/session-archive` `1.2.1`（[GitHub](https://github.com/THao712/dsh-session-archive)）
+配套插件：`@local/session-archive` `1.3.0`（[GitHub](https://github.com/THao712/dsh-session-archive)）
 
 本文件记录已经确认的架构决策、完成记录和仍然缺少的证据。下次修改前先读这里，再读 `OPTIMIZATION_PLAN.md` 中剩余的待办。
 
@@ -15,9 +15,10 @@ DeepSeek Harness 的会话清理插件。设置页列出已归档会话和对话
 ## 发布位置
 
 - 会话清理：<https://github.com/THao712/dsh-session-cleaner>
-- 配套归档：<https://github.com/THao712/dsh-session-archive>（当前 `0989e6a`，`1.2.1`）
+- 配套归档：<https://github.com/THao712/dsh-session-archive>（`1.3.0`，提交 `694c7b6`）
 - GitHub 安装命令使用 HTTPS 地址：`https://github.com/THao712/dsh-session-archive.git`；`github:` shorthand 在部分机器的 npm Git 配置下会走 SSH 并失败。
-- 公开版 session-archive 的 `roots` 是空数组，表示所有工作区；只希望处理某个工作区时，在 `cordis.patch.yml` 写回绝对路径。
+- 公开版 session-archive 的 `roots: []` 只处理目录名以 `default-workspace` 结尾的默认工作区；项目工作区必须显式加入 `roots`，避免在仓库里生成 `conversations/`。
+- 安装 session-cleaner 不会自动安装 session-archive；两者是独立 bundle。
 
 ## 不可破坏的安全约束
 

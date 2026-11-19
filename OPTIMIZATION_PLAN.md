@@ -4,7 +4,7 @@
 
 当前版本：`1.10.0`
 
-配套：`@local/session-archive` `1.2.1`（[GitHub](https://github.com/THao712/dsh-session-archive)）
+配套：`@local/session-archive` `1.3.0`（[GitHub](https://github.com/THao712/dsh-session-archive)）
 
 第 12、13 节中已实现并验证的内容已移入 [MEMORY.md](MEMORY.md)，本文件只保留尚未完成、需要真实环境或更高成本验证的工作。
 

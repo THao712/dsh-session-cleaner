@@ -28,13 +28,13 @@ session-archive 会为每个对话创建工作区独立目录：
 - 清理会话记录已经不存在、但目录仍残留的孤儿目录；
 - 通过共享的 `conversations/.index.lock` 串行更新索引，避免两边互相覆盖。
 
-单独使用会话清理也可以删除日志、检查点、附件和工作区文件，只是没有按对话隔离的目录可管理。推荐版本组合：session-cleaner `1.10.0` 与 session-archive `1.2.1` 或更高。
+单独使用会话清理也可以删除日志、检查点、附件和工作区文件，只是没有按对话隔离的目录可管理。推荐版本组合：session-cleaner `1.10.0` 与 session-archive `1.3.0` 或更高。
 
 ```text
 dsh plugin --profile <profile> add https://github.com/THao712/dsh-session-archive.git
 ```
 
-安装两个插件后都需要完全重启 Harness。
+**安装会话清理插件不会自动下载或启用 session-archive。** 两者是独立的 bundle，需要分别安装；这样用户可以选择是否采用“每个对话一个目录”的布局。安装两个插件后都需要完全重启 Harness。
 
 ## 删除范围
 

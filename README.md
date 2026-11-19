@@ -31,7 +31,7 @@ session-archive 会为每个对话创建工作区独立目录：
 单独使用会话清理也可以删除日志、检查点、附件和工作区文件，只是没有按对话隔离的目录可管理。推荐版本组合：session-cleaner `1.10.0` 与 session-archive `1.2.1` 或更高。
 
 ```text
-dsh plugin --profile <profile> add github:THao712/dsh-session-archive
+dsh plugin --profile <profile> add https://github.com/THao712/dsh-session-archive.git
 ```
 
 安装两个插件后都需要完全重启 Harness。

@@ -12,6 +12,13 @@
 
 DeepSeek Harness 的会话清理插件。设置页列出已归档会话和对话目录，先预览、再两次确认，删除会话日志、投影检查点、仅被这些会话引用的附件、溢出目录、工作区文件，以及可选的 session-archive 对话目录。
 
+## 发布位置
+
+- 会话清理：<https://github.com/THao712/dsh-session-cleaner>
+- 配套归档：<https://github.com/THao712/dsh-session-archive>（当前 `0989e6a`，`1.2.1`）
+- GitHub 安装命令使用 HTTPS 地址：`https://github.com/THao712/dsh-session-archive.git`；`github:` shorthand 在部分机器的 npm Git 配置下会走 SSH 并失败。
+- 公开版 session-archive 的 `roots` 是空数组，表示所有工作区；只希望处理某个工作区时，在 `cordis.patch.yml` 写回绝对路径。
+
 ## 不可破坏的安全约束
 
 - 浏览器只提交选择项，不提交权威路径；Host 在预览和执行时都重新推导候选。

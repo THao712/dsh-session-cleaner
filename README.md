@@ -6,6 +6,36 @@ A DeepSeek Harness plugin that previews and permanently deletes archived Session
 
 一个 DeepSeek Harness 插件：在 **设置 → 会话清理** 中选择已归档的会话，先完整预览，再点击两次确认永久删除。
 
+## 搭配 session-archive 效果更好
+
+推荐同时安装配套插件：[THao712/dsh-session-archive](https://github.com/THao712/dsh-session-archive)。
+
+session-archive 会为每个对话创建工作区独立目录：
+
+```text
+<workspace>/conversations/<时间_标题>/
+  work/
+  out/
+  session.json
+  AGENTS.md
+```
+
+两者配合后，会话清理可以：
+
+- 从 `conversations/index.json` 与 `session.json` 找到会话对应的对话目录；
+- 删除会话时可选“同时整目录删除”；
+- 在独立的“对话目录”区域选择“保留 out”或“全部删除”；
+- 清理会话记录已经不存在、但目录仍残留的孤儿目录；
+- 通过共享的 `conversations/.index.lock` 串行更新索引，避免两边互相覆盖。
+
+单独使用会话清理也可以删除日志、检查点、附件和工作区文件，只是没有按对话隔离的目录可管理。推荐版本组合：session-cleaner `1.10.0` 与 session-archive `1.2.1` 或更高。
+
+```text
+dsh plugin --profile <profile> add github:THao712/dsh-session-archive
+```
+
+安装两个插件后都需要完全重启 Harness。
+
 ## 删除范围
 
 对每个选中的已归档会话，插件会清理：

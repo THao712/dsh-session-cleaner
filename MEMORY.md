@@ -4,7 +4,7 @@
 
 当前版本：`1.10.0`（本轮代码提交 `62397ca`，上一轮 `0f3031f`）
 
-配套插件：`@local/session-archive` `1.2.1`
+配套插件：`@local/session-archive` `1.2.1`（[GitHub](https://github.com/THao712/dsh-session-archive)）
 
 本文件记录已经确认的架构决策、完成记录和仍然缺少的证据。下次修改前先读这里，再读 `OPTIMIZATION_PLAN.md` 中剩余的待办。
 

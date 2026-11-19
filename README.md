@@ -6,6 +6,14 @@ A DeepSeek Harness plugin that previews and permanently deletes archived Session
 
 一个 DeepSeek Harness 插件：在 **设置 → 会话清理** 中选择已归档的会话，先完整预览，再点击两次确认永久删除。
 
+## 界面预览
+
+![会话清理设置页：搜索、排序和已归档会话列表](docs/screenshots/session-list.png)
+
+![清理范围：整目录删除、附件、工作区文件、时间窗扫描和溢出目录](docs/screenshots/cleanup-options.png)
+
+![预览按钮、已选容量和对话目录入口](docs/screenshots/preview-and-folders.png)
+
 ## 搭配 session-archive 效果更好
 
 推荐同时安装配套插件：[THao712/dsh-session-archive](https://github.com/THao712/dsh-session-archive)。

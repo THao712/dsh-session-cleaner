@@ -75,10 +75,10 @@ dsh plugin --profile <profile> add https://github.com/THao712/dsh-session-archiv
 从 GitHub 安装（当前为 GitHub-only 分发，不依赖 npm）：
 
 ```text
-dsh plugin --profile <profile> add github:THao712/dsh-session-cleaner
+dsh plugin --profile <profile> add https://github.com/THao712/dsh-session-cleaner.git
 ```
 
-包名是 `dsh-session-cleaner-thao712`。Desktop 用户也可以通过 dsh-market 的插件页安装。
+包名是 `dsh-session-cleaner-thao712`。如果本机 npm 的 Git 配置支持 shorthand，也可以使用 `github:THao712/dsh-session-cleaner`；遇到 SSH publickey 错误时改用 HTTPS 地址。Desktop 用户也可以通过 dsh-market 的插件页安装。
 
 本地开发时，把**本地仓库绝对路径**作为 bundle 安装：
 

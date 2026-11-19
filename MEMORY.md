@@ -19,6 +19,7 @@ DeepSeek Harness 的会话清理插件。设置页列出已归档会话和对话
 - GitHub 安装命令使用 HTTPS 地址：`https://github.com/THao712/dsh-session-archive.git`；`github:` shorthand 在部分机器的 npm Git 配置下会走 SSH 并失败。
 - 公开版 session-archive 的 `roots: []` 只处理目录名以 `default-workspace` 结尾的默认工作区；项目工作区必须显式加入 `roots`，避免在仓库里生成 `conversations/`。
 - 安装 session-cleaner 不会自动安装 session-archive；两者是独立 bundle。
+- 市场展示：仓库根 `screenshots.json` 指向 `docs/screenshots/session-list.png` 和 `docs/screenshots/cleanup-options.png`；目录条目 PR 为 <https://github.com/awesome-dsh-plugin/awesome-dsh-plugin/pull/16969>。市场通常在 PR 合并后的下一次 nightly 构建读取截图与文案。
 
 ## 不可破坏的安全约束
 
